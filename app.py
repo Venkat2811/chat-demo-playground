@@ -453,6 +453,14 @@ hdrs = (
             color: var(--brrrllm-color);
         }
 
+        .comparison-subtext {
+            font-size: 1.1rem;
+            color: var(--text-muted);
+            margin-top: 8px;
+            font-style: italic;
+            font-weight: 500;
+        }
+
         /* Header Styles */
         .header {
             background: var(--card-bg);
@@ -1176,6 +1184,33 @@ hdrs = (
 app, rt = fast_app(hdrs=hdrs)
 
 
+# ---------- HTTP Client Pool ----------
+
+# Global HTTP client pool for connection reuse
+_http_client_pool: Optional[httpx.AsyncClient] = None
+
+async def get_http_client() -> httpx.AsyncClient:
+    """Get or create a shared HTTP client with connection pooling optimized for high concurrency."""
+    global _http_client_pool
+    if _http_client_pool is None:
+        _http_client_pool = httpx.AsyncClient(
+            timeout=httpx.Timeout(None),
+            limits=httpx.Limits(
+                max_connections=250,  # Increased for 200+ concurrency
+                max_keepalive_connections=250,  # Keep all connections alive
+                keepalive_expiry=60.0  # Longer keepalive for sustained load
+            ),
+            http2=False  # Disable HTTP/2 for better streaming compatibility
+        )
+    return _http_client_pool
+
+async def cleanup_http_client():
+    """Cleanup HTTP client pool."""
+    global _http_client_pool
+    if _http_client_pool:
+        await _http_client_pool.aclose()
+        _http_client_pool = None
+
 # ---------- Provider streaming ----------
 
 class StreamError(Exception):
@@ -1226,24 +1261,24 @@ async def stream_openai_chat(
     url = cfg.base_url.rstrip("/") + "/chat/completions"
 
     async def do_stream(stream_body):
-        async with httpx.AsyncClient(timeout=None) as client:
-            async with client.stream("POST", url, headers=headers, json=stream_body) as resp:
-                if resp.status_code >= 400:
-                    raise StreamError(f"Provider {cfg.name} HTTP {resp.status_code}")
-                async for line in resp.aiter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        js = json.loads(data)
-                    except Exception:
-                        continue
-                    for ch in js.get("choices", []):
-                        delta = ch.get("delta", {}).get("content")
-                        if delta:
-                            yield delta
+        client = await get_http_client()
+        async with client.stream("POST", url, headers=headers, json=stream_body) as resp:
+            if resp.status_code >= 400:
+                raise StreamError(f"Provider {cfg.name} HTTP {resp.status_code}")
+            async for line in resp.aiter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    js = json.loads(data)
+                except Exception:
+                    continue
+                for ch in js.get("choices", []):
+                    delta = ch.get("delta", {}).get("content")
+                    if delta:
+                        yield delta
 
     # No fallback: if strict settings fail, propagate the error
     async for tok in do_stream(body):
@@ -1273,31 +1308,31 @@ async def stream_openai_completions(
 
     url = cfg.base_url.rstrip("/") + "/completions"
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        try:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
-                if resp.status_code >= 400:
-                    error_text = await resp.aread()
-                    print(f"Error response: {error_text}")
-                    raise StreamError(f"Provider {cfg.name} HTTP {resp.status_code}: {error_text}")
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        js = json.loads(data)
-                    except Exception:
-                        continue
-                    for ch in js.get("choices", []):
-                        text = ch.get("text")
-                        if text:
-                            yield text
-        except httpx.HTTPError as e:
-            raise StreamError(str(e)) from e
+    client = await get_http_client()
+    try:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code >= 400:
+                error_text = await resp.aread()
+                print(f"Error response: {error_text}")
+                raise StreamError(f"Provider {cfg.name} HTTP {resp.status_code}: {error_text}")
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    js = json.loads(data)
+                except Exception:
+                    continue
+                for ch in js.get("choices", []):
+                    text = ch.get("text")
+                    if text:
+                        yield text
+    except httpx.HTTPError as e:
+        raise StreamError(str(e)) from e
 
 
 async def stream_openai_responses(
@@ -1332,46 +1367,46 @@ async def stream_openai_responses(
 
     url = cfg.base_url.rstrip("/") + "/responses"
 
-    async with httpx.AsyncClient(timeout=None) as client:
-        try:
-            async with client.stream("POST", url, headers=headers, json=body) as resp:
-                if resp.status_code >= 400:
-                    err = await resp.aread()
-                    raise StreamError(f"Provider {cfg.name} HTTP {resp.status_code}: {err}")
-                async for raw in resp.aiter_lines():
-                    if not raw:
-                        continue
-                    if raw.startswith(":"):
-                        continue
-                    if not raw.startswith("data:"):
-                        continue
-                    data = raw[5:].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        js = json.loads(data)
-                    except Exception:
-                        continue
-                    et = js.get("type")
-                    if et == "response.output_text.delta":
-                        delta = js.get("delta")
-                        if delta:
-                            yield str(delta)
-                    # Periodic/final usage
-                    usage = None
-                    if isinstance(js.get("usage"), dict):
-                        usage = js.get("usage")
-                    elif isinstance(js.get("response"), dict) and isinstance(js["response"].get("usage"), dict):
-                        usage = js["response"]["usage"]
-                    if usage and isinstance(usage.get("output_tokens"), int):
-                        out_tok = usage.get("output_tokens")
-                        in_tok = usage.get("input_tokens") if isinstance(usage.get("input_tokens"), int) else None
-                        if in_tok is not None:
-                            yield "\x00USAGE:" + f"{out_tok},{in_tok}"
-                        else:
-                            yield "\x00USAGE:" + str(out_tok)
-        except httpx.HTTPError as e:
-            raise StreamError(str(e)) from e
+    client = await get_http_client()
+    try:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code >= 400:
+                err = await resp.aread()
+                raise StreamError(f"Provider {cfg.name} HTTP {resp.status_code}: {err}")
+            async for raw in resp.aiter_lines():
+                if not raw:
+                    continue
+                if raw.startswith(":"):
+                    continue
+                if not raw.startswith("data:"):
+                    continue
+                data = raw[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    js = json.loads(data)
+                except Exception:
+                    continue
+                et = js.get("type")
+                if et == "response.output_text.delta":
+                    delta = js.get("delta")
+                    if delta:
+                        yield str(delta)
+                # Periodic/final usage
+                usage = None
+                if isinstance(js.get("usage"), dict):
+                    usage = js.get("usage")
+                elif isinstance(js.get("response"), dict) and isinstance(js["response"].get("usage"), dict):
+                    usage = js["response"]["usage"]
+                if usage and isinstance(usage.get("output_tokens"), int):
+                    out_tok = usage.get("output_tokens")
+                    in_tok = usage.get("input_tokens") if isinstance(usage.get("input_tokens"), int) else None
+                    if in_tok is not None:
+                        yield "\x00USAGE:" + f"{out_tok},{in_tok}"
+                    else:
+                        yield "\x00USAGE:" + str(out_tok)
+    except httpx.HTTPError as e:
+        raise StreamError(str(e)) from e
 
 
 async def stream_provider(cfg: ProviderConfig, prompt: str, max_tokens: int) -> AsyncGenerator[str, None]:
@@ -1550,7 +1585,7 @@ async def run_batch(
         async with metrics_lock:
             all_metrics.append(metrics)
 
-    # Launch tasks with concurrency limiting
+    # Launch tasks with concurrency limiting - fire all at once for max RPS
     print(f"run_batch: total_reqs={total_reqs}, concurrency={concurrency}, dataset_entries={len(dataset_entries)}")
     max_conc = max(1, int(concurrency or 1))
     sem = asyncio.Semaphore(max_conc)
@@ -1570,6 +1605,9 @@ async def run_batch(
         num_requests = min(total_reqs, len(dataset_entries))
 
     print(f"Creating {num_requests} tasks (total_reqs={total_reqs}, dataset_entries={len(dataset_entries)})")
+
+    # Fire all tasks immediately for maximum request rate (similar to vLLM benchmark_serving.py with request_rate="inf")
+    # The semaphore will control actual concurrency, but all tasks are created at once
     for i in range(1, num_requests + 1):
         tasks.append(asyncio.create_task(limited_task(i)))
 
@@ -1842,26 +1880,26 @@ async def run_batch(
                 f"Per-user output speed [1/TPOT] (tok/s/user): {per_user_output_speed:.4f}"
             )
             ttft_lines = (
-                f"Mean TTFT (ms):      {(sum(ttfts)/len(ttfts) if ttfts else 0):.0f}\n"
-                f"Median TTFT (ms):    {pct(ttfts, 50):.0f}\n"
-                f"P90 TTFT (ms):       {pct(ttfts, 90):.0f}\n"
-                f"P99 TTFT (ms):       {pct(ttfts, 99):.0f}"
+                f"Mean TTFT (ms):      {(sum(ttfts)/len(ttfts) if ttfts else 0):>8.0f}\n"
+                f"Median TTFT (ms):    {pct(ttfts, 50):>8.0f}\n"
+                f"P90 TTFT (ms):       {pct(ttfts, 90):>8.0f}\n"
+                f"P99 TTFT (ms):       {pct(ttfts, 99):>8.0f}"
             )
             tpot_lines = (
-                f"Mean TPOT (ms):      {(sum(tpots)/len(tpots) if tpots else 0):.1f}\n"
-                f"Median TPOT (ms):    {pct(tpots, 50):.1f}\n"
-                f"P90 TPOT (ms):       {pct(tpots, 90):.1f}"
+                f"Mean TPOT (ms):      {(sum(tpots)/len(tpots) if tpots else 0):>8.1f}\n"
+                f"Median TPOT (ms):    {pct(tpots, 50):>8.1f}\n"
+                f"P90 TPOT (ms):       {pct(tpots, 90):>8.1f}"
             )
             itl_lines = (
-                f"Mean ITL (ms):       {(sum(all_itls)/len(all_itls) if all_itls else 0):.1f}\n"
-                f"Median ITL (ms):     {pct(all_itls, 50):.1f}\n"
-                f"P90 ITL (ms):        {pct(all_itls, 90):.1f}"
+                f"Mean ITL (ms):       {(sum(all_itls)/len(all_itls) if all_itls else 0):>8.1f}\n"
+                f"Median ITL (ms):     {pct(all_itls, 50):>8.1f}\n"
+                f"P90 ITL (ms):        {pct(all_itls, 90):>8.1f}"
             )
             e2e_lines = (
-                f"Mean E2EL (ms):      {(sum(e2es)/len(e2es) if e2es else 0):.0f}\n"
-                f"Median E2EL (ms):    {pct(e2es, 50):.0f}\n"
-                f"P90 E2EL (ms):       {pct(e2es, 90):.0f}\n"
-                f"P99 E2EL (ms):       {pct(e2es, 99):.0f}"
+                f"Mean E2EL (ms):      {(sum(e2es)/len(e2es) if e2es else 0):>8.0f}\n"
+                f"Median E2EL (ms):    {pct(e2es, 50):>8.0f}\n"
+                f"P90 E2EL (ms):       {pct(e2es, 90):>8.0f}\n"
+                f"P99 E2EL (ms):       {pct(e2es, 99):>8.0f}"
             )
 
             # Build a compact stats grid for the collapsed view
@@ -1951,38 +1989,38 @@ async def run_batch(
             # Build expanded group cards
             hw_lines = (
                 f"Model:  {HW.get('gpu_model','GPU')}\n"
-                f"Count:  {GPU_COUNT}"
+                f"Count:  {GPU_COUNT:>3}"
             )
             req_lines = (
-                f"Total requests:       {total_reqs}\n"
-                f"Successful:           {completed}\n"
-                f"Total input tokens:    {total_input_tokens}\n"
-                f"Total output tokens:   {total_output_tokens}\n"
-                f"Concurrency:          {concurrency}\n"
-                f"Req throughput (req/s): {throughput:.2f}"
+                f"Total requests:      {total_reqs:>8}\n"
+                f"Successful:          {completed:>8}\n"
+                f"Total input tokens:  {total_input_tokens:>8}\n"
+                f"Total output tokens: {total_output_tokens:>8}\n"
+                f"Concurrency:         {concurrency:>8}\n"
+                f"Req throughput (req/s): {throughput:>5.2f}"
             )
             # New Throughput section with all token metrics
             duration_s = duration if duration > 0 else 1  # duration is already in seconds
             throughput_lines = (
-                f"Input tok/s:          {(total_input_tokens / duration_s):.1f}\n"
-                f"Output tok/s:         {output_token_throughput:.1f}\n"
-                f"Total tok/s:          {total_token_throughput:.1f}\n"
-                f"Output tok/s/user:   {per_user_output_throughput:.2f}\n"
-                f"Output tok/s/gpu:    {per_gpu_output_throughput:.2f}\n"
-                f"Req throughput:       {throughput:.2f} req/s"
+                f"Input tok/s:         {(total_input_tokens / duration_s):>8.1f}\n"
+                f"Output tok/s:        {output_token_throughput:>8.1f}\n"
+                f"Total tok/s:         {total_token_throughput:>8.1f}\n"
+                f"Output tok/s/user:   {per_user_output_throughput:>8.2f}\n"
+                f"Output tok/s/gpu:    {per_gpu_output_throughput:>8.2f}\n"
+                f"Req throughput:      {throughput:>8.2f} req/s"
             )
 
             # Per User section
             per_user_lines = (
-                f"Mean TTFT (ms):       {(sum(ttfts)/len(ttfts) if ttfts else 0):.0f}\n"
-                f"Mean TPOT (ms):       {(sum(tpots)/len(tpots) if tpots else 0):.1f}\n"
-                f"Mean ITL (ms):        {(sum(all_itls)/len(all_itls) if all_itls else 0):.1f}\n"
-                f"Mean E2EL (ms):       {(sum(e2es)/len(e2es) if e2es else 0):.0f}"
+                f"Mean TTFT (ms):      {(sum(ttfts)/len(ttfts) if ttfts else 0):>8.0f}\n"
+                f"Mean TPOT (ms):      {(sum(tpots)/len(tpots) if tpots else 0):>8.1f}\n"
+                f"Mean ITL (ms):       {(sum(all_itls)/len(all_itls) if all_itls else 0):>8.1f}\n"
+                f"Mean E2EL (ms):      {(sum(e2es)/len(e2es) if e2es else 0):>8.0f}"
             )
 
             totals_lines = (
-                f"Total latency (ms):   {sum_e2e_ms:.1f}\n"
-                f"Avg req latency (ms): {avg_req_latency_ms:.1f}"
+                f"Total latency (ms):  {sum_e2e_ms:>10.1f}\n"
+                f"Avg req latency (ms):{avg_req_latency_ms:>10.1f}"
             )
 
             top_summary = Div(
@@ -2105,6 +2143,10 @@ def index(req):
                 Span("vs", cls="vs-text"),
                 Span("BrrrLLM", cls="brrrllm-text"),
                 cls="comparison-text"
+            ),
+            Div(
+                "(both engines w/o extra caching)",
+                cls="comparison-subtext"
             ),
             cls="comparison-banner"
         ),
@@ -2409,34 +2451,7 @@ def load_run_modes(dataset: str = None):
     if dataset == "sharegpt_1k_to_1025_all":
         return Div(
             Label(
-                Input(type="radio", name="mode", value="203x40", checked=True,
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "All 203 Requests (40 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="203x80",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "All 203 Requests (80 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="203x120",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "All 203 Requests (120 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x40",
+                Input(type="radio", name="mode", value="1421x40", checked=True,
                       hx_post="/load_prompts",
                       hx_target="#prompts-container",
                       hx_trigger="change",
@@ -2460,6 +2475,42 @@ def load_run_modes(dataset: str = None):
                       hx_trigger="change",
                       hx_include="#controls"),
                 "1421 Requests - 203×7 (120 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x140",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (140 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x160",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (160 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x180",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (180 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x200",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (200 Concurrent)",
                 cls="radio-label"
             ),
             cls="radio-group"
@@ -2538,20 +2589,21 @@ def _parse_mode(mode: str) -> tuple[int, int]:
         return 10, 2
     if m == "50x10":
         return 50, 10
-    # New modes for the sharegpt_1k_to_1025_all dataset
-    if m == "203x40":
-        return 203, 40
-    if m == "203x80":
-        return 203, 80
-    if m == "203x120":
-        return 203, 120
-    # 1421 requests (203 * 7) modes
+    # 1421 requests (203 * 7) modes with various concurrency levels
     if m == "1421x40":
         return 1421, 40
     if m == "1421x80":
         return 1421, 80
     if m == "1421x120":
         return 1421, 120
+    if m == "1421x140":
+        return 1421, 140
+    if m == "1421x160":
+        return 1421, 160
+    if m == "1421x180":
+        return 1421, 180
+    if m == "1421x200":
+        return 1421, 200
     return 1, 1
 
 
