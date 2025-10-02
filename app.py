@@ -118,10 +118,20 @@ _dataset_cache: dict[str, list[dict]] = {}
 def _datasets_list() -> list[DatasetConfig]:
     dss: list[DatasetConfig] = []
 
-    # Always add ShareGPT dataset
+    # Always add ShareGPT datasets
     dss.append(DatasetConfig(
         name="sharegpt_min1k_50",
         path="/Users/venkat/Downloads/sharegpt_min1k_50.jsonl",
+        fmt="jsonl",
+        prompt_field="prompt",
+        response_field="response",
+        prompt_tokens_field="prompt_tokens",
+        response_tokens_field="response_tokens"
+    ))
+
+    dss.append(DatasetConfig(
+        name="sharegpt_1k_to_1025_all",
+        path="/Users/venkat/Downloads/sharegpt_1k_to_1025_all.jsonl",
         fmt="jsonl",
         prompt_field="prompt",
         response_field="response",
@@ -292,6 +302,84 @@ def _extract_prompt_and_response(entry: dict, ds: DatasetConfig) -> tuple[str, s
 hdrs = (
     # Enable HTMX SSE extension
     Script(src="https://unpkg.com/htmx-ext-sse@2.2.3/sse.js"),
+    # Global script: toggle expand/collapse of performance metrics
+    Script(
+        """
+        window.togglePerfMetrics = function(btn) {
+            try {
+                var root = null;
+                if (btn && btn.closest) root = btn.closest('#perf-summary, .perf-summary');
+                if (!root) root = document.getElementById('perf-summary');
+                if (!root) return;
+                var button = btn || root.querySelector('#expand-toggle');
+                var content = root.querySelector('#perf-metrics-content');
+                // Find all metric section cards within the metrics rows
+                var rows = root.querySelectorAll('.metrics-row');
+                var sections = [];
+                for (var r=0; r<rows.length; r++) {
+                    var cards = rows[r].querySelectorAll('.metric-section-card');
+                    for (var c=0; c<cards.length; c++) {
+                        sections.push(cards[c]);
+                    }
+                }
+                // Fallback to ID-based selection if no cards found
+                if (sections.length === 0) {
+                    var ids = ['hw-expanded','req-expanded','user-expanded','pergpu-expanded','totals-expanded','ttft-expanded','tpot-expanded','itl-expanded','e2e-expanded'];
+                    for (var i=0; i<ids.length; i++) {
+                        var el = document.getElementById(ids[i]);
+                        if (el) sections.push(el);
+                    }
+                }
+                var expanded = (root.getAttribute('data-expanded') === '1');
+
+                if (!expanded) {
+                    if (content) { content.classList.add('perf-metrics-expanded'); content.classList.remove('perf-metrics-collapsed'); }
+                    for (var j=0; j<sections.length; j++) { if (sections[j]) sections[j].style.display = 'block'; }
+                    if (button) button.textContent = 'Collapse All';
+                    root.setAttribute('data-expanded', '1');
+                } else {
+                    if (content) { content.classList.remove('perf-metrics-expanded'); content.classList.add('perf-metrics-collapsed'); }
+                    for (var k=0; k<sections.length; k++) { if (sections[k]) sections[k].style.display = 'none'; }
+                    if (button) button.textContent = 'Expand All';
+                    root.setAttribute('data-expanded', '0');
+                }
+            } catch (e) {
+                try { console.error('togglePerfMetrics error:', e); } catch(_){ }
+            }
+        }
+
+        window.openGroupPopup = function(groupId, title) {
+            try {
+                var overlay = document.getElementById('popup-overlay');
+                var box = document.getElementById('popup-box');
+                var titleEl = document.getElementById('popup-title');
+                var contentEl = document.getElementById('popup-content');
+                var group = document.getElementById(groupId);
+                if (!overlay || !box || !contentEl || !group) return;
+                var titleNode = group.querySelector('.metric-section-title');
+                titleEl.textContent = title || (titleNode ? titleNode.textContent : 'Details');
+                contentEl.innerHTML = '';
+                var pre = document.createElement('pre');
+                var raw = group.textContent || '';
+                // Drop the first line if it's the section title
+                var lines = raw.split('\\n');
+                if (lines.length > 1 && lines[0].trim().length > 0) lines.shift();
+                pre.textContent = lines.join('\\n').trim();
+                contentEl.appendChild(pre);
+                overlay.style.display = 'flex';
+                document.body.style.overflow = 'hidden';
+            } catch (e) {
+                try { console.error('openGroupPopup error:', e); } catch(_){ }
+            }
+        }
+
+        window.closeGroupPopup = function() {
+            var overlay = document.getElementById('popup-overlay');
+            if (overlay) overlay.style.display = 'none';
+            document.body.style.overflow = '';
+        }
+        """
+    ),
     Style(
         """
         :root {
@@ -885,18 +973,67 @@ hdrs = (
             font-size: 0.9rem;
             line-height: 1.6;
             white-space: normal;
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            display: flex;
+            flex-direction: column;
             gap: 16px;
         }
 
-        @media (min-width: 1200px) {
-            .perf-metrics { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+        /* Row layout for metric sections */
+        .metrics-row {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+            width: 100%;
+        }
+
+        @media (min-width: 768px) {
+            .metrics-row:first-of-type {
+                grid-template-columns: repeat(4, 1fr);
+            }
+            .metrics-row:nth-of-type(2) {
+                grid-template-columns: repeat(5, 1fr);
+            }
+        }
+
+        @media (min-width: 1400px) {
+            .metrics-row {
+                gap: 16px;
+            }
         }
 
         /* Override for tile grids inside perf metrics */
-        .perf-metrics .stats-grid { white-space: normal; font-family: inherit; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
-        .metric-section { white-space: pre; }
+        .perf-metrics .stats-grid {
+            white-space: normal;
+            font-family: inherit;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 12px;
+        }
+
+        .metric-section {
+            white-space: pre;
+            margin: 0;
+            padding: 10px;
+            background: #f8fafc;
+            border-radius: 6px;
+        }
+
+        .metric-section-card {
+            white-space: pre;
+            padding: 12px;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+            transition: all 0.2s ease;
+            font-size: 0.85rem;
+            min-height: 100px;
+        }
+
+        .metric-section-card:hover {
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            transform: translateY(-2px);
+        }
 
         .perf-metrics-collapsed {
             max-height: none;
@@ -907,18 +1044,110 @@ hdrs = (
             max-height: none;
         }
 
-        .metric-section {
-            margin: 0;
-            padding: 10px;
-            background: #f8fafc;
-            border-radius: 6px;
+        .stat-item { cursor: pointer; }
+
+        /* Popup styles */
+        .popup-overlay {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            background: rgba(15, 23, 42, 0.75);
+            backdrop-filter: blur(4px);
+            z-index: 1000;
+            padding: 20px;
+            animation: fadeIn 0.2s ease;
         }
 
+        @keyframes fadeIn {
+            from { opacity: 0; }
+            to { opacity: 1; }
+        }
+
+        @keyframes slideUp {
+            from { transform: translateY(20px); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+
+        .popup-box {
+            width: min(720px, 95vw);
+            max-height: 85vh;
+            overflow: auto;
+            background: linear-gradient(135deg, #ffffff 0%, #f8fafc 100%);
+            border-radius: 12px;
+            border: 1px solid rgba(226, 232, 240, 0.8);
+            box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+            animation: slideUp 0.3s ease;
+        }
+
+        .popup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 16px 20px;
+            border-bottom: 1px solid rgba(226, 232, 240, 0.8);
+            background: linear-gradient(180deg, rgba(255,255,255,0.9) 0%, rgba(248,250,252,0.9) 100%);
+            border-radius: 12px 12px 0 0;
+        }
+
+        .popup-title {
+            font-weight: 700;
+            color: var(--primary-color);
+            font-size: 1.1rem;
+        }
+
+        .popup-body {
+            padding: 20px;
+            font-family: 'Monaco', 'Courier New', monospace;
+            background: white;
+            border-radius: 0 0 12px 12px;
+        }
+
+        .popup-body pre {
+            background: #f8fafc;
+            padding: 16px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+            margin: 0;
+            font-size: 0.9rem;
+            line-height: 1.5;
+        }
+
+        .popup-close {
+            background: transparent;
+            border: none;
+            font-size: 24px;
+            cursor: pointer;
+            color: #64748b;
+            transition: all 0.2s ease;
+            padding: 0 4px;
+        }
+
+        .popup-close:hover {
+            color: var(--danger-color);
+            transform: rotate(90deg);
+        }
+        
         .metric-section-title {
             color: var(--primary-color);
             font-weight: 700;
             margin: 0 0 8px 0;
             font-size: 0.95rem;
+        }
+
+        .metric-section-title.clickable {
+            cursor: pointer;
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: all 0.2s ease;
+        }
+
+        .metric-section-title.clickable:hover {
+            background: var(--primary-color);
+            color: white;
+            transform: translateX(2px);
         }
 
         /* Scrollbar Styling */
@@ -1588,18 +1817,85 @@ async def run_batch(
 
             # Build a compact stats grid for the collapsed view
             collapsed_stats = Div(
-                Div(Div("Successful Requests", cls="stat-label"), Div(str(completed), cls="stat-value"), cls="stat-item"),
-                Div(Div("Duration", cls="stat-label"), Div(f"{duration:.2f}s", cls="stat-value"), cls="stat-item"),
-                Div(Div("Total Input Tokens", cls="stat-label"), Div(str(total_input_tokens), cls="stat-value"), cls="stat-item"),
-                Div(Div("Total Generated Tokens", cls="stat-label"), Div(str(total_output_tokens), cls="stat-value"), cls="stat-item"),
-                Div(Div("Req Throughput", cls="stat-label"), Div(f"{throughput:.2f} req/s", cls="stat-value"), cls="stat-item"),
-                Div(Div("Output Tok/s", cls="stat-label"), Div(f"{output_token_throughput:.1f}", cls="stat-value"), cls="stat-item"),
-                Div(Div("Tok/s per User", cls="stat-label"), Div(f"{per_user_output_throughput:.2f}", cls="stat-value"), cls="stat-item"),
-                Div(Div("Tok/s per GPU", cls="stat-label"), Div(f"{per_gpu_output_throughput:.2f}", cls="stat-value"), cls="stat-item"),
-                Div(Div("Total Tok/s", cls="stat-label"), Div(f"{total_token_throughput:.1f}", cls="stat-value"), cls="stat-item"),
-                Div(Div("Avg Req Latency", cls="stat-label"), Div(f"{avg_req_latency_ms:.1f}ms", cls="stat-value"), cls="stat-item"),
-                Div(Div("1/TPOT per User", cls="stat-label"), Div(f"{per_user_output_speed:.2f}", cls="stat-value"), cls="stat-item"),
-                Div(Div("Hardware", cls="stat-label"), Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"), cls="stat-item"),
+                # Put Hardware first
+                Div(
+                    Div("Hardware", cls="stat-label"),
+                    Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('hw-expanded','Hardware')"
+                ),
+                Div(
+                    Div("Successful Requests", cls="stat-label"),
+                    Div(str(completed), cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('req-expanded','Requests')"
+                ),
+                Div(
+                    Div("Duration", cls="stat-label"),
+                    Div(f"{duration:.2f}s", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('req-expanded','Requests')"
+                ),
+                Div(
+                    Div("Total Input Tokens", cls="stat-label"),
+                    Div(str(total_input_tokens), cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('req-expanded','Requests')"
+                ),
+                Div(
+                    Div("Total Generated Tokens", cls="stat-label"),
+                    Div(str(total_output_tokens), cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('req-expanded','Requests')"
+                ),
+                Div(
+                    Div("Concurrency", cls="stat-label"),
+                    Div(str(concurrency), cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('req-expanded','Requests')"
+                ),
+                Div(
+                    Div("Req Throughput", cls="stat-label"),
+                    Div(f"{throughput:.2f} req/s", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('req-expanded','Requests')"
+                ),
+                Div(
+                    Div("Output Tok/s", cls="stat-label"),
+                    Div(f"{output_token_throughput:.1f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('totals-expanded','Totals')"
+                ),
+                Div(
+                    Div("Tok/s per User", cls="stat-label"),
+                    Div(f"{per_user_output_throughput:.2f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('user-expanded','Per User')"
+                ),
+                Div(
+                    Div("Tok/s per GPU", cls="stat-label"),
+                    Div(f"{per_gpu_output_throughput:.2f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('pergpu-expanded','Per GPU')"
+                ),
+                Div(
+                    Div("Total Tok/s", cls="stat-label"),
+                    Div(f"{total_token_throughput:.1f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('totals-expanded','Totals')"
+                ),
+                Div(
+                    Div("Avg Req Latency", cls="stat-label"),
+                    Div(f"{avg_req_latency_ms:.1f}ms", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('totals-expanded','Totals')"
+                ),
+                Div(
+                    Div("1/TPOT per User", cls="stat-label"),
+                    Div(f"{per_user_output_speed:.2f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('user-expanded','Per User')"
+                ),
                 cls="stats-grid"
             )
 
@@ -1616,22 +1912,28 @@ async def run_batch(
                 f"Concurrency:          {concurrency}\n"
                 f"Req throughput (req/s): {throughput:.2f}"
             )
-            user_lines = (
-                f"Output tok/s/user:    {per_user_output_throughput:.2f}\n"
+            # New Throughput section with all token metrics
+            duration_s = duration if duration > 0 else 1  # duration is already in seconds
+            throughput_lines = (
+                f"Input tok/s:          {(total_input_tokens / duration_s):.1f}\n"
+                f"Output tok/s:         {output_token_throughput:.1f}\n"
+                f"Total tok/s:          {total_token_throughput:.1f}\n"
+                f"Output tok/s/user:   {per_user_output_throughput:.2f}\n"
+                f"Output tok/s/gpu:    {per_gpu_output_throughput:.2f}\n"
+                f"Req throughput:       {throughput:.2f} req/s"
+            )
+
+            # Per User section
+            per_user_lines = (
                 f"Mean TTFT (ms):       {(sum(ttfts)/len(ttfts) if ttfts else 0):.0f}\n"
-                f"P50 TTFT (ms):        {pct(ttfts, 50):.0f}\n"
                 f"Mean TPOT (ms):       {(sum(tpots)/len(tpots) if tpots else 0):.1f}\n"
                 f"Mean ITL (ms):        {(sum(all_itls)/len(all_itls) if all_itls else 0):.1f}\n"
                 f"Mean E2EL (ms):       {(sum(e2es)/len(e2es) if e2es else 0):.0f}"
             )
-            per_gpu_lines = (
-                f"Output tok/s/gpu:     {per_gpu_output_throughput:.2f}"
-            )
+
             totals_lines = (
-                f"Total tok/s:          {total_token_throughput:.1f}\n"
                 f"Total latency (ms):   {sum_e2e_ms:.1f}\n"
-                f"Avg req latency (ms): {avg_req_latency_ms:.1f}\n"
-                f"Req throughput:       {throughput:.2f} req/s"
+                f"Avg req latency (ms): {avg_req_latency_ms:.1f}"
             )
 
             top_summary = Div(
@@ -1640,26 +1942,66 @@ async def run_batch(
                     Button(
                         "Expand All",
                         cls="expand-btn",
-                        onclick="togglePerfMetrics()",
-                        id="expand-toggle"
+                        onclick="togglePerfMetrics(this)",
+                        id="expand-toggle",
+                        type="button"
                     ),
                     cls="perf-header"
                 ),
                 Div(
+                    # Main collapsed summary at the top (full width)
                     Div(collapsed_stats, cls="metric-section full-span"),
-                    Div(Div("Hardware", cls="metric-section-title"), hw_lines, cls="metric-section", id="hw-expanded", style="display: none;"),
-                    Div(Div("Requests", cls="metric-section-title"), req_lines, cls="metric-section", id="req-expanded", style="display: none;"),
-                    Div(Div("Per User", cls="metric-section-title"), user_lines, cls="metric-section", id="user-expanded", style="display: none;"),
-                    Div(Div("Per GPU", cls="metric-section-title"), per_gpu_lines, cls="metric-section", id="pergpu-expanded", style="display: none;"),
-                    Div(Div("Totals", cls="metric-section-title"), totals_lines, cls="metric-section", id="totals-expanded", style="display: none;"),
-                    Div(Div("Time to First Token", cls="metric-section-title"), ttft_lines, cls="metric-section", id="ttft-expanded", style="display: none;"),
-                    Div(Div("Time per Output Token", cls="metric-section-title"), tpot_lines, cls="metric-section", id="tpot-expanded", style="display: none;"),
-                    Div(Div("Inter-token Latency", cls="metric-section-title"), itl_lines, cls="metric-section", id="itl-expanded", style="display: none;"),
-                    Div(Div("End-to-end Latency", cls="metric-section-title"), e2e_lines, cls="metric-section", id="e2e-expanded", style="display: none;"),
+
+                    # First row: Hardware, Throughput, Requests, Per User/GPU
+                    Div(
+                        Div(
+                            Div("Hardware", cls="metric-section-title clickable", onclick="openGroupPopup('hw-expanded','Hardware')"),
+                            hw_lines, cls="metric-section-card", id="hw-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("Throughput", cls="metric-section-title clickable", onclick="openGroupPopup('throughput-expanded','Throughput')"),
+                            throughput_lines, cls="metric-section-card", id="throughput-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("Requests", cls="metric-section-title clickable", onclick="openGroupPopup('req-expanded','Requests')"),
+                            req_lines, cls="metric-section-card", id="req-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("Per User", cls="metric-section-title clickable", onclick="openGroupPopup('user-expanded','Per User')"),
+                            per_user_lines, cls="metric-section-card", id="user-expanded", style="display: none;"
+                        ),
+                        cls="metrics-row"
+                    ),
+
+                    # Second row: Totals and timing metrics
+                    Div(
+                        Div(
+                            Div("Totals", cls="metric-section-title clickable", onclick="openGroupPopup('totals-expanded','Totals')"),
+                            totals_lines, cls="metric-section-card", id="totals-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("Time to First Token", cls="metric-section-title clickable", onclick="openGroupPopup('ttft-expanded','Time to First Token')"),
+                            ttft_lines, cls="metric-section-card", id="ttft-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("Time per Output Token", cls="metric-section-title clickable", onclick="openGroupPopup('tpot-expanded','Time per Output Token')"),
+                            tpot_lines, cls="metric-section-card", id="tpot-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("Inter-token Latency", cls="metric-section-title clickable", onclick="openGroupPopup('itl-expanded','Inter-token Latency')"),
+                            itl_lines, cls="metric-section-card", id="itl-expanded", style="display: none;"
+                        ),
+                        Div(
+                            Div("End-to-end Latency", cls="metric-section-title clickable", onclick="openGroupPopup('e2e-expanded','End-to-end Latency')"),
+                            e2e_lines, cls="metric-section-card", id="e2e-expanded", style="display: none;"
+                        ),
+                        cls="metrics-row"
+                    ),
                     id="perf-metrics-content",
                     cls="perf-metrics perf-metrics-collapsed"
                 ),
                 id="perf-summary",
+                **{"data-expanded": "0"},
                 hx_swap_oob="outerHTML",
                 cls="perf-summary"
             )
@@ -1756,7 +2098,8 @@ def index(req):
                                    hx_post="/load_prompts",
                                    hx_target="#prompts-container",
                                    hx_trigger="change",
-                                   hx_include="#controls"),
+                                   hx_include="#controls",
+                                   **{"hx-on::after-request": "htmx.trigger(htmx.find('#run-mode-options'), 'reload-modes')"}),
                             cls="form-group"
                         ),
                         Div(
@@ -1767,39 +2110,16 @@ def index(req):
                         cls="control-section"
                     ),
 
-                    # Right column - Run mode
+                    # Right column - Run mode (will be dynamically loaded)
                     Div(
                         Div(
                             Label("Run Mode"),
                             Div(
-                                Label(
-                                    Input(type="radio", name="mode", value="single", checked=True,
-                                          hx_post="/load_prompts",
-                                          hx_target="#prompts-container",
-                                          hx_trigger="change",
-                                          hx_include="#controls"),
-                                    "Single Request",
-                                    cls="radio-label"
-                                ),
-                                Label(
-                                    Input(type="radio", name="mode", value="10x1",
-                                          hx_post="/load_prompts",
-                                          hx_target="#prompts-container",
-                                          hx_trigger="change",
-                                          hx_include="#controls"),
-                                    "10 Requests (2 Concurrent)",
-                                    cls="radio-label"
-                                ),
-                                Label(
-                                    Input(type="radio", name="mode", value="50x10",
-                                          hx_post="/load_prompts",
-                                          hx_target="#prompts-container",
-                                          hx_trigger="change",
-                                          hx_include="#controls"),
-                                    "50 Requests (10 Concurrent)",
-                                    cls="radio-label"
-                                ),
-                                cls="radio-group"
+                                id="run-mode-options",
+                                cls="radio-group",
+                                hx_post="/load_run_modes",
+                                hx_trigger="load, reload-modes",
+                                hx_include="#dataset-select"
                             ),
                             cls="form-group"
                         ),
@@ -1813,6 +2133,19 @@ def index(req):
 
         # Results (place above prompts so the run header appears first)
         Div(id="results", cls="results-container"),
+
+        # Popup overlay for group details
+        Div(
+            Div(
+                Div(
+                    Span("Details", id="popup-title", cls="popup-title"),
+                    Button("×", cls="popup-close", onclick="closeGroupPopup()")
+                , cls="popup-header"),
+                Div(id="popup-content", cls="popup-body"),
+                cls="popup-box", id="popup-box"
+            ),
+            id="popup-overlay", cls="popup-overlay"
+        ),
 
         # Prompts Container (auto-load on page load)
         Div(
@@ -1846,13 +2179,21 @@ def load_prompts(dataset: str = None, mode: str = None):
     total, _ = _parse_mode(mode)
 
     try:
-        entries = _load_dataset_entries(ds, max(total, 50))  # Load up to 50 entries
+        # For the new dataset with 203 entries, always load all of them
+        # This ensures all prompts are available regardless of the selected mode
+        if dataset == "sharegpt_1k_to_1025_all":
+            max_load = 203  # Always load all 203 entries for this dataset
+        else:
+            max_load = max(total, 50)
+        entries = _load_dataset_entries(ds, max_load)
         if not entries:
             return Div("No entries found in dataset", style="color: var(--danger-color);")
 
         # Create prompt boxes
         prompt_boxes = []
-        for i, entry in enumerate(entries[:total]):
+        # For the sharegpt_1k_to_1025_all dataset, always show all 203 entries
+        display_count = len(entries) if dataset == "sharegpt_1k_to_1025_all" else total
+        for i, entry in enumerate(entries[:display_count]):
             prompt, response, p_tokens, r_tokens = _extract_prompt_and_response(entry, ds)
 
             box = Div(
@@ -1897,32 +2238,34 @@ def load_prompts(dataset: str = None, mode: str = None):
                 Button(
                     "Expand All",
                     cls="expand-btn",
-                    onclick="togglePerfMetrics()",
+                    onclick="togglePerfMetrics(this)",
                     id="expand-toggle",
+                    type="button",
                 ),
                 cls="perf-header",
             ),
             Div(
                 Div(
-                    Div(Div("SUCCESSFUL REQUESTS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("DURATION", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("TOTAL INPUT TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("TOTAL GENERATED TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("CONCURRENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("REQ THROUGHPUT", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("OUTPUT TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("TOK/S PER USER", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("TOK/S PER GPU", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("TOTAL TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("AVG REQ LATENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
-                    Div(Div("HARDWARE", cls="stat-label"), Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"), cls="stat-item"),
+                    # Hardware first in placeholder too (clickable)
+                    Div(Div("HARDWARE", cls="stat-label"), Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('hw-expanded','Hardware')"),
+                    Div(Div("SUCCESSFUL REQUESTS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
+                    Div(Div("DURATION", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
+                    Div(Div("TOTAL INPUT TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
+                    Div(Div("TOTAL GENERATED TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
+                    Div(Div("CONCURRENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
+                    Div(Div("REQ THROUGHPUT", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
+                    Div(Div("OUTPUT TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('totals-expanded','Totals')"),
+                    Div(Div("TOK/S PER USER", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('user-expanded','Per User')"),
+                    Div(Div("TOK/S PER GPU", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('pergpu-expanded','Per GPU')"),
+                    Div(Div("TOTAL TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('totals-expanded','Totals')"),
+                    Div(Div("AVG REQ LATENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('totals-expanded','Totals')"),
                     cls="stats-grid",
                 ),
                 cls="metric-section full-span",
             ),
             Div(
                 Div(
-                    Div("Time to First Token", cls="metric-section-title"),
+                    Div("Time to First Token", cls="metric-section-title clickable", onclick="openGroupPopup('ttft-expanded','Time to First Token')"),
                     "Mean TTFT (ms):      --\n"
                     "Median TTFT (ms):    --\n"
                     "P90 TTFT (ms):       --\n"
@@ -1932,7 +2275,7 @@ def load_prompts(dataset: str = None, mode: str = None):
                     style="display: none;",
                 ),
                 Div(
-                    Div("Time per Output Token", cls="metric-section-title"),
+                    Div("Time per Output Token", cls="metric-section-title clickable", onclick="openGroupPopup('tpot-expanded','Time per Output Token')"),
                     "Mean TPOT (ms):      --\n"
                     "Median TPOT (ms):    --\n"
                     "P90 TPOT (ms):       --\n"
@@ -1942,7 +2285,7 @@ def load_prompts(dataset: str = None, mode: str = None):
                     style="display: none;",
                 ),
                 Div(
-                    Div("Inter-token Latency", cls="metric-section-title"),
+                    Div("Inter-token Latency", cls="metric-section-title clickable", onclick="openGroupPopup('itl-expanded','Inter-token Latency')"),
                     "Mean ITL (ms):       --\n"
                     "Median ITL (ms):     --\n"
                     "P90 ITL (ms):        --\n"
@@ -1952,7 +2295,7 @@ def load_prompts(dataset: str = None, mode: str = None):
                     style="display: none;",
                 ),
                 Div(
-                    Div("End-to-end Latency", cls="metric-section-title"),
+                    Div("End-to-end Latency", cls="metric-section-title clickable", onclick="openGroupPopup('e2e-expanded','End-to-end Latency')"),
                     "Mean E2EL (ms):      --\n"
                     "Median E2EL (ms):    --\n"
                     "P90 E2EL (ms):       --\n"
@@ -1966,6 +2309,7 @@ def load_prompts(dataset: str = None, mode: str = None):
             ),
             cls="perf-summary",
             id="perf-summary",
+            **{"data-expanded": "0"},
         )
 
         return Div(
@@ -1986,6 +2330,77 @@ def load_prompts(dataset: str = None, mode: str = None):
     except Exception as e:
         return Div(f"Error loading dataset: {str(e)}", style="color: var(--danger-color);")
 
+
+@rt
+def load_run_modes(dataset: str = None):
+    """Load run mode options based on the selected dataset."""
+    if not dataset:
+        dataset = "sharegpt_min1k_50"  # Default dataset
+
+    # Special handling for the new dataset
+    if dataset == "sharegpt_1k_to_1025_all":
+        return Div(
+            Label(
+                Input(type="radio", name="mode", value="203x20", checked=True,
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "All 203 Requests (20 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="203x50",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "All 203 Requests (50 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="203x100",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "All 203 Requests (100 Concurrent)",
+                cls="radio-label"
+            ),
+            cls="radio-group"
+        )
+    else:
+        # Default options for other datasets
+        return Div(
+            Label(
+                Input(type="radio", name="mode", value="single", checked=True,
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "Single Request",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="10x1",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "10 Requests (2 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="50x10",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "50 Requests (10 Concurrent)",
+                cls="radio-label"
+            ),
+            cls="radio-group"
+        )
 
 @rt
 def sample(dataset: str):
@@ -2028,6 +2443,13 @@ def _parse_mode(mode: str) -> tuple[int, int]:
         return 10, 2
     if m == "50x10":
         return 50, 10
+    # New modes for the sharegpt_1k_to_1025_all dataset
+    if m == "203x20":
+        return 203, 20
+    if m == "203x50":
+        return 203, 50
+    if m == "203x100":
+        return 203, 100
     return 1, 1
 
 
@@ -2059,13 +2481,13 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
             try:
                 parsed = json.loads(loaded_entries)
                 if isinstance(parsed, list) and parsed:
-                    entries = parsed[:min(total, 50)]
+                    entries = parsed[:total]  # Use all requested entries
                 else:
-                    entries = _load_dataset_entries(ds, min(total, 50))
+                    entries = _load_dataset_entries(ds, total)
             except Exception:
-                entries = _load_dataset_entries(ds, min(total, 50))
+                entries = _load_dataset_entries(ds, total)
         else:
-            entries = _load_dataset_entries(ds, min(total, 50))
+            entries = _load_dataset_entries(ds, total)
 
         if not entries:
             return Div(
@@ -2086,7 +2508,7 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
         "dataset_entries": entries,
         "ds_config": ds,
         "out_tokens": int(out_tokens),
-        "total": min(total, len(entries)),
+        "total": total,
         "conc": conc,
         "use_loaded": bool(loaded_entries)
     }
@@ -2097,12 +2519,16 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
     run = Div(
         # Clear old results before adding new one
         Script("""
-            // Close any existing SSE connections
-            document.querySelectorAll('[sse-connect]').forEach(el => {
-                if (el.htmx && el.htmx.sseSource) {
-                    el.htmx.sseSource.close();
+            // Close any existing SSE connections (ES5)
+            (function(){
+                var list = document.querySelectorAll('[sse-connect]');
+                for (var i=0; i<list.length; i++) {
+                    var el = list[i];
+                    if (el.htmx && el.htmx.sseSource) {
+                        try { el.htmx.sseSource.close(); } catch(_){ }
+                    }
                 }
-            });
+            })();
         """),
         Div(
             Div(
