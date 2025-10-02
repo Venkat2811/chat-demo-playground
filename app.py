@@ -945,8 +945,8 @@ hdrs = (
             background: white;
             border: 1px solid var(--border-color);
             border-radius: var(--radius);
-            padding: 20px;
-            margin-bottom: 20px;
+            padding: 16px; /* tighter to make room for more rows */
+            margin-bottom: 16px;
             box-shadow: var(--shadow);
         }
 
@@ -954,8 +954,8 @@ hdrs = (
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 15px;
-            padding-bottom: 10px;
+            margin-bottom: 10px; /* reduce wasted vertical space */
+            padding-bottom: 6px;
             border-bottom: 2px solid var(--border-color);
         }
 
@@ -988,7 +988,7 @@ hdrs = (
             white-space: normal;
             display: flex;
             flex-direction: column;
-            gap: 16px;
+            gap: 8px; /* reduce gap between summary tiles and first row */
         }
 
         /* Row layout for metric sections */
@@ -1043,7 +1043,7 @@ hdrs = (
         .metric-section {
             white-space: pre;
             margin: 0;
-            padding: 10px;
+            padding: 8px; /* slightly tighter */
             background: #f8fafc;
             border-radius: 6px;
         }
@@ -1775,6 +1775,19 @@ async def run_batch(
             mean_tpot_ms = (sum(tpots)/len(tpots)) if tpots else 0.0
             per_user_output_speed = (1000.0 / mean_tpot_ms) if mean_tpot_ms > 0 else 0.0
 
+            # Engine-generation throughput: tokens per second while generating (excludes TTFT)
+            gen_time_sum_s = 0.0
+            for m in all_metrics:
+                try:
+                    gen_ms = max(0.0, (m.e2e_ms or 0.0) - (m.ttft_ms or 0.0))
+                    gen_time_sum_s += gen_ms / 1000.0
+                except Exception:
+                    pass
+            # Normalize by concurrency to approximate wall-time spent in generation across the system
+            normalized_gen_seconds = (gen_time_sum_s / max(concurrency or 1, 1)) if gen_time_sum_s > 0 else 0.0
+            engine_gen_tok_s = (total_output_tokens / normalized_gen_seconds) if normalized_gen_seconds > 0 else 0.0
+            engine_gen_tok_s_per_gpu = engine_gen_tok_s / max(GPU_COUNT, 1)
+
             summary = Div(
                 Div("Summary Statistics", cls="summary-title"),
                 Div(
@@ -1893,6 +1906,8 @@ async def run_batch(
                 f"Total generated tokens:             {total_output_tokens}\n"
                 f"Request throughput (req/s):         {throughput:.2f}\n"
                 f"Output token throughput (tok/s):    {output_token_throughput:.1f}\n"
+                f"Engine generation tok/s:            {engine_gen_tok_s:.1f}\n"
+                f"Engine generation tok/s/gpu:        {engine_gen_tok_s_per_gpu:.2f}\n"
                 f"Per-user output throughput (tok/s/user): {per_user_output_throughput:.2f}\n"
                 f"Per-GPU output throughput (tok/s/gpu):   {per_gpu_output_throughput:.2f}\n"
                 f"Total token throughput (tok/s):     {total_token_throughput:.1f}\n"
@@ -1958,6 +1973,18 @@ async def run_batch(
                     cls="stat-item",
                     onclick="openGroupPopup('throughput-expanded','Throughput')"
                 ),
+                Div(
+                    Div("Engine Gen Tok/s", cls="stat-label"),
+                    Div(f"{engine_gen_tok_s:,.1f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('throughput-expanded','Throughput')"
+                ),
+                Div(
+                    Div("Engine Gen Tok/s/GPU", cls="stat-label"),
+                    Div(f"{engine_gen_tok_s_per_gpu:,.2f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('throughput-expanded','Throughput')"
+                ),
                 # Row 2 - Remaining items
                 Div(
                     Div("Total Tok/s", cls="stat-label"),
@@ -2012,6 +2039,8 @@ async def run_batch(
                 f"Output tok/s:             {output_token_throughput:>10,.1f}\n"
                 f"Total tok/s:              {total_token_throughput:>10,.1f}\n"
                 f"Output tok/s/gpu:         {per_gpu_output_throughput:>10,.2f}\n"
+                f"Engine gen tok/s:         {engine_gen_tok_s:>10,.1f}\n"
+                f"Engine gen tok/s/gpu:     {engine_gen_tok_s_per_gpu:>10,.2f}\n"
                 f"Req throughput:           {throughput:>10.2f} req/s"
             )
 
@@ -2350,6 +2379,8 @@ def load_prompts(dataset: str = None, mode: str = None):
             Div(Div("Concurrency", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
             Div(Div("Output Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
             Div(Div("Tok/s per GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Engine Gen Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Engine Gen Tok/s/GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
             Div(Div("Total Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
             Div(Div("Total Input Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
             Div(Div("Total Generated Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
