@@ -1011,7 +1011,6 @@ async def stream_openai_chat(
     }
     if getattr(cfg, "force_output_tokens", False):
         body["min_tokens"] = max_tokens
-        body["ignore_eos"] = True
 
     url = cfg.base_url.rstrip("/") + "/chat/completions"
 
@@ -1099,8 +1098,8 @@ async def stream_openai_responses(
 
     Uses the /v1/responses endpoint with output token controls and parses
     response.output_text.delta events. When force_output_tokens is enabled,
-    sends min_output_tokens=max_tokens and ignore_eos=True to better enforce
-    exact output length on vLLM.
+    sends min_output_tokens=max_tokens to better enforce exact output length
+    on vLLM.
     """
     if httpx is None:
         raise StreamError("httpx is required. Install with: pip install httpx")
@@ -1119,7 +1118,6 @@ async def stream_openai_responses(
     if getattr(cfg, "force_output_tokens", False):
         # Stronger enforcement on vLLM
         body["min_output_tokens"] = max_tokens
-        body["ignore_eos"] = True
 
     url = cfg.base_url.rstrip("/") + "/responses"
 
