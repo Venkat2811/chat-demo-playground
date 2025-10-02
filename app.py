@@ -1464,12 +1464,16 @@ async def run_one_request(
             last_token_time = t
 
             # Calculate live metrics
-            if len(metrics.token_times) > 1:
-                time_since_first = t - metrics.first_token_time
-                metrics.tpot_ms = (time_since_first / (token_count - 1)) * 1000.0 if token_count > 1 else 0
-                total_time = t - metrics.start_time
-                # Approximate tokens per second using the estimated output token count
-                metrics.tps = (metrics.output_tokens / total_time) if total_time > 0 else 0
+            if metrics.output_tokens > 1 and metrics.first_token_time is not None:
+                # Live TPOT calculation matching vLLM approach
+                time_since_first = (t - metrics.first_token_time) * 1000.0  # Convert to ms
+                metrics.tpot_ms = time_since_first / (metrics.output_tokens - 1)
+            else:
+                metrics.tpot_ms = 0.0
+
+            total_time = t - metrics.start_time
+            # Approximate tokens per second using the estimated output token count
+            metrics.tps = (metrics.output_tokens / total_time) if total_time > 0 else 0
 
             # Send token and live metrics
             await enqueue("token", tag, req_id, {
@@ -1490,6 +1494,15 @@ async def run_one_request(
 
     metrics.end_time = now()
     metrics.e2e_ms = (metrics.end_time - metrics.start_time) * 1000.0
+
+    # Calculate final TPOT following vLLM benchmark approach
+    if metrics.output_tokens > 1 and metrics.ttft_ms > 0:
+        # TPOT = (total_latency - ttft) / (output_tokens - 1)
+        latency_minus_ttft_ms = metrics.e2e_ms - metrics.ttft_ms
+        metrics.tpot_ms = latency_minus_ttft_ms / (metrics.output_tokens - 1)
+    else:
+        metrics.tpot_ms = 0.0
+
     # Strict check only if provider usage was observed
     if usage_seen and metrics.output_tokens != max_tokens:
         raise StreamError(f"Output tokens {metrics.output_tokens} != expected {max_tokens}")
@@ -1513,6 +1526,10 @@ async def run_batch(
     all_metrics: list[RequestMetrics] = []
     metrics_lock = asyncio.Lock()
 
+    # For large batches (203+ requests), update UI less frequently
+    # Also check if this is the sharegpt_1k_to_1025_all dataset
+    is_large_batch = total_reqs >= 203 or ds_config.name == "sharegpt_1k_to_1025_all"
+
     async def enqueue(kind: str, tag: str, req_id: int, payload: Any):
         await queue.put((kind, tag, req_id, payload))
 
@@ -1520,7 +1537,14 @@ async def run_batch(
     batch_start = now()
 
     async def task_fn(i: int):
-        entry = dataset_entries[min(i - 1, len(dataset_entries) - 1)]
+        # For 1421 requests mode, wrap around the 203 entries
+        if total_reqs == 1421:
+            # Use modulo to cycle through the 203 entries
+            entry_idx = (i - 1) % len(dataset_entries)
+        else:
+            entry_idx = min(i - 1, len(dataset_entries) - 1)
+
+        entry = dataset_entries[entry_idx]
         prompt, response, p_tokens, r_tokens = _extract_prompt_and_response(entry, ds_config)
         metrics = await run_one_request(cfg, prompt, response, p_tokens, out_tokens, enqueue, tag, i)
         async with metrics_lock:
@@ -1536,7 +1560,17 @@ async def run_batch(
             await task_fn(i)
 
     tasks: list[asyncio.Task] = []
-    for i in range(1, min(total_reqs, len(dataset_entries)) + 1):
+    # Handle special cases for dataset
+    if total_reqs == 203:
+        num_requests = len(dataset_entries)
+    elif total_reqs == 1421:
+        # For 1421 requests, we'll cycle through the 203 entries 7 times
+        num_requests = 1421
+    else:
+        num_requests = min(total_reqs, len(dataset_entries))
+
+    print(f"Creating {num_requests} tasks (total_reqs={total_reqs}, dataset_entries={len(dataset_entries)})")
+    for i in range(1, num_requests + 1):
         tasks.append(asyncio.create_task(limited_task(i)))
 
     completed = 0
@@ -1546,6 +1580,10 @@ async def run_batch(
         nonlocal completed
 
         if kind == "create_box":
+            # Skip creating individual boxes for large batches to avoid UI overwhelm
+            if is_large_batch:
+                return ""
+
             prm = str(payload.get("prompt", ""))[:500]  # Truncate for display
             in_tok = int(payload.get("in_tokens", 0))
 
@@ -1600,6 +1638,10 @@ async def run_batch(
                 return to_xml(box)
 
         elif kind == "token":
+            # Skip token updates for large batches to avoid UI overwhelm
+            if is_large_batch:
+                return ""
+
             data = payload
             token = data.get("token", "")
             metrics = data.get("metrics", {})
@@ -1632,13 +1674,20 @@ async def run_batch(
         elif kind == "end":
             async with completed_lock:
                 completed += 1
+                # For large batches, provide progress updates every 10 completions
+                if is_large_batch and completed % 10 == 0:
+                    progress_html = f'<span id="status-{tag}" hx-swap-oob="outerHTML">'
+                    progress_html += f'<span class="status-badge status-running">RUNNING ({completed}/{total_reqs})</span>'
+                    progress_html += '</span>'
+                    return progress_html
             return ""
 
         elif kind == "summary":
             # Generate comprehensive summary statistics
             async with metrics_lock:
                 ttfts = [m.ttft_ms for m in all_metrics if m.ttft_ms > 0]
-                tpots = [m.tpot_ms for m in all_metrics if m.tpot_ms > 0]
+                # Only include TPOT for requests with >1 output tokens (per vLLM)
+                tpots = [m.tpot_ms for m in all_metrics if m.output_tokens > 1 and m.tpot_ms > 0]
                 e2es = [m.e2e_ms for m in all_metrics if m.e2e_ms > 0]
                 all_itls = []
                 for m in all_metrics:
@@ -2102,11 +2151,8 @@ def index(req):
                                    **{"hx-on::after-request": "htmx.trigger(htmx.find('#run-mode-options'), 'reload-modes')"}),
                             cls="form-group"
                         ),
-                        Div(
-                            Label("Max Output Tokens"),
-                            Input(type="number", name="out_tokens", value=500, min=1, max=2000),
-                            cls="form-group"
-                        ),
+                        # Hidden input for out_tokens with default value
+                        Input(type="hidden", name="out_tokens", value=500),
                         cls="control-section"
                     ),
 
@@ -2175,8 +2221,8 @@ def load_prompts(dataset: str = None, mode: str = None):
     if not ds:
         return Div(f"Dataset not found: {dataset}", style="color: var(--danger-color);")
 
-    # Parse mode to get number of requests
-    total, _ = _parse_mode(mode)
+    # Parse mode to get number of requests and concurrency
+    total, conc = _parse_mode(mode)
 
     try:
         # For the new dataset with 203 entries, always load all of them
@@ -2191,8 +2237,30 @@ def load_prompts(dataset: str = None, mode: str = None):
 
         # Create prompt boxes
         prompt_boxes = []
-        # For the sharegpt_1k_to_1025_all dataset, always show all 203 entries
-        display_count = len(entries) if dataset == "sharegpt_1k_to_1025_all" else total
+        # For the sharegpt_1k_to_1025_all dataset, never show individual request/response boxes
+        if dataset == "sharegpt_1k_to_1025_all":
+            display_count = 0
+            # Add a notice instead
+            if total == 1421:
+                message = f"⚡ {total} requests mode - Running 203 dataset entries × 7 iterations"
+            else:
+                message = f"⚡ {total} requests mode - Running all 203 dataset entries"
+
+            prompt_boxes.append(
+                Div(
+                    message,
+                    Div(
+                        f"Concurrency: {conc if conc else 'N/A'}",
+                        style="margin-top: 10px; font-weight: bold;"
+                    ),
+                    cls="info-message",
+                    style="padding: 20px; background: var(--info-bg, #e8f4f8); color: var(--info-color, #0066cc); border-radius: 8px; margin: 20px 0;"
+                )
+            )
+        else:
+            # For other datasets, show prompt boxes as usual
+            display_count = total
+
         for i, entry in enumerate(entries[:display_count]):
             prompt, response, p_tokens, r_tokens = _extract_prompt_and_response(entry, ds)
 
@@ -2341,30 +2409,57 @@ def load_run_modes(dataset: str = None):
     if dataset == "sharegpt_1k_to_1025_all":
         return Div(
             Label(
-                Input(type="radio", name="mode", value="203x20", checked=True,
+                Input(type="radio", name="mode", value="203x40", checked=True,
                       hx_post="/load_prompts",
                       hx_target="#prompts-container",
                       hx_trigger="change",
                       hx_include="#controls"),
-                "All 203 Requests (20 Concurrent)",
+                "All 203 Requests (40 Concurrent)",
                 cls="radio-label"
             ),
             Label(
-                Input(type="radio", name="mode", value="203x50",
+                Input(type="radio", name="mode", value="203x80",
                       hx_post="/load_prompts",
                       hx_target="#prompts-container",
                       hx_trigger="change",
                       hx_include="#controls"),
-                "All 203 Requests (50 Concurrent)",
+                "All 203 Requests (80 Concurrent)",
                 cls="radio-label"
             ),
             Label(
-                Input(type="radio", name="mode", value="203x100",
+                Input(type="radio", name="mode", value="203x120",
                       hx_post="/load_prompts",
                       hx_target="#prompts-container",
                       hx_trigger="change",
                       hx_include="#controls"),
-                "All 203 Requests (100 Concurrent)",
+                "All 203 Requests (120 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x40",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (40 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x80",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (80 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x120",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (120 Concurrent)",
                 cls="radio-label"
             ),
             cls="radio-group"
@@ -2444,12 +2539,19 @@ def _parse_mode(mode: str) -> tuple[int, int]:
     if m == "50x10":
         return 50, 10
     # New modes for the sharegpt_1k_to_1025_all dataset
-    if m == "203x20":
-        return 203, 20
-    if m == "203x50":
-        return 203, 50
-    if m == "203x100":
-        return 203, 100
+    if m == "203x40":
+        return 203, 40
+    if m == "203x80":
+        return 203, 80
+    if m == "203x120":
+        return 203, 120
+    # 1421 requests (203 * 7) modes
+    if m == "1421x40":
+        return 1421, 40
+    if m == "1421x80":
+        return 1421, 80
+    if m == "1421x120":
+        return 1421, 120
     return 1, 1
 
 
@@ -2459,6 +2561,7 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
     rid = uuid.uuid4().hex[:8]
     ttag = f"RUN-{rid}"
     total, conc = _parse_mode(mode)
+    print(f"Parsed mode '{mode}' to total={total}, conc={conc}")
 
     # Load dataset
     if not dataset:
@@ -2481,13 +2584,23 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
             try:
                 parsed = json.loads(loaded_entries)
                 if isinstance(parsed, list) and parsed:
-                    entries = parsed[:total]  # Use all requested entries
+                    # For sharegpt_1k_to_1025_all, use all loaded entries
+                    if dataset == "sharegpt_1k_to_1025_all":
+                        entries = parsed  # Use all 203 entries
+                    else:
+                        entries = parsed[:total]  # Use requested entries for other datasets
                 else:
-                    entries = _load_dataset_entries(ds, total)
+                    # Load all 203 for the special dataset, otherwise load requested amount
+                    max_load = 203 if dataset == "sharegpt_1k_to_1025_all" else total
+                    entries = _load_dataset_entries(ds, max_load)
             except Exception:
-                entries = _load_dataset_entries(ds, total)
+                # Load all 203 for the special dataset, otherwise load requested amount
+                max_load = 203 if dataset == "sharegpt_1k_to_1025_all" else total
+                entries = _load_dataset_entries(ds, max_load)
         else:
-            entries = _load_dataset_entries(ds, total)
+            # Load all 203 for the special dataset, otherwise load requested amount
+            max_load = 203 if dataset == "sharegpt_1k_to_1025_all" else total
+            entries = _load_dataset_entries(ds, max_load)
 
         if not entries:
             return Div(
@@ -2514,6 +2627,7 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
     }
     print(f"Cleared old runs: {old_runs}")
     print(f"Created run {rid} in RUNS. Current runs: {list(RUNS.keys())}")
+    print(f"Run {rid}: total={total}, conc={conc}, entries={len(entries)}")
 
     # Create run container with a script to clear previous results
     run = Div(
