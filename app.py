@@ -2339,7 +2339,25 @@ def load_prompts(dataset: str = None, mode: str = None):
             )
             prompt_boxes.append(box)
 
-        # Performance summary placeholder
+        # Performance summary placeholder (show hardware; others blank)
+        collapsed_stats_default = Div(
+            Div(
+                Div("Hardware", cls="stat-label"),
+                Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"),
+                cls="stat-item"
+            ),
+            Div(Div("Successful Requests", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Concurrency", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Output Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Tok/s per GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Total Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Total Input Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Total Generated Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Duration", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            Div(Div("Req Throughput", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+            cls="stats-grid"
+        )
+
         perf_summary = Div(
             Div(
                 Div("Performance Summary", cls="perf-title"),
@@ -2353,16 +2371,9 @@ def load_prompts(dataset: str = None, mode: str = None):
                 cls="perf-header",
             ),
             Div(
-                Div(
-                    "No benchmark results yet. Select a dataset and click 'Start' to begin benchmarking.",
-                    style="text-align: center; padding: 40px 20px; color: #64748b; font-size: 1rem;"
-                ),
-                cls="metric-section full-span",
-            ),
-            Div(
+                Div(collapsed_stats_default, cls="metric-section full-span"),
                 id="perf-metrics-content",
                 cls="perf-metrics perf-metrics-collapsed",
-                style="display: none;"  # Hide entire metrics section when empty
             ),
             cls="perf-summary",
             id="perf-summary",
