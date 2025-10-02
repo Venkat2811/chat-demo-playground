@@ -2141,7 +2141,7 @@ def index(req):
                     cls="header-left"
                 ),
                 Button(
-                    "Run Chat",
+                    "Start",
                     cls="btn btn-success",
                     hx_post="/start_run",
                     hx_target="#results",
@@ -2334,66 +2334,15 @@ def load_prompts(dataset: str = None, mode: str = None):
             ),
             Div(
                 Div(
-                    # Hardware first in placeholder too (clickable)
-                    Div(Div("HARDWARE", cls="stat-label"), Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('hw-expanded','Hardware')"),
-                    Div(Div("SUCCESSFUL REQUESTS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
-                    Div(Div("DURATION", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
-                    Div(Div("TOTAL INPUT TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
-                    Div(Div("TOTAL GENERATED TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
-                    Div(Div("CONCURRENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
-                    Div(Div("REQ THROUGHPUT", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('req-expanded','Requests')"),
-                    Div(Div("OUTPUT TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('totals-expanded','Totals')"),
-                    Div(Div("TOK/S PER USER", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('user-expanded','Per User')"),
-                    Div(Div("TOK/S PER GPU", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('pergpu-expanded','Per GPU')"),
-                    Div(Div("TOTAL TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('totals-expanded','Totals')"),
-                    Div(Div("AVG REQ LATENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item", onclick="openGroupPopup('totals-expanded','Totals')"),
-                    cls="stats-grid",
+                    "No benchmark results yet. Select a dataset and click 'Start' to begin benchmarking.",
+                    style="text-align: center; padding: 40px 20px; color: #64748b; font-size: 1rem;"
                 ),
                 cls="metric-section full-span",
             ),
             Div(
-                Div(
-                    Div("Time to First Token", cls="metric-section-title clickable", onclick="openGroupPopup('ttft-expanded','Time to First Token')"),
-                    "Mean TTFT (ms):      --\n"
-                    "Median TTFT (ms):    --\n"
-                    "P90 TTFT (ms):       --\n"
-                    "P99 TTFT (ms):       --",
-                    cls="metric-section",
-                    id="ttft-expanded",
-                    style="display: none;",
-                ),
-                Div(
-                    Div("Time per Output Token", cls="metric-section-title clickable", onclick="openGroupPopup('tpot-expanded','Time per Output Token')"),
-                    "Mean TPOT (ms):      --\n"
-                    "Median TPOT (ms):    --\n"
-                    "P90 TPOT (ms):       --\n"
-                    "P99 TPOT (ms):       --",
-                    cls="metric-section",
-                    id="tpot-expanded",
-                    style="display: none;",
-                ),
-                Div(
-                    Div("Inter-token Latency", cls="metric-section-title clickable", onclick="openGroupPopup('itl-expanded','Inter-token Latency')"),
-                    "Mean ITL (ms):       --\n"
-                    "Median ITL (ms):     --\n"
-                    "P90 ITL (ms):        --\n"
-                    "P99 ITL (ms):        --",
-                    cls="metric-section",
-                    id="itl-expanded",
-                    style="display: none;",
-                ),
-                Div(
-                    Div("End-to-end Latency", cls="metric-section-title clickable", onclick="openGroupPopup('e2e-expanded','End-to-end Latency')"),
-                    "Mean E2EL (ms):      --\n"
-                    "Median E2EL (ms):    --\n"
-                    "P90 E2EL (ms):       --\n"
-                    "P99 E2EL (ms):       --",
-                    cls="metric-section",
-                    id="e2e-expanded",
-                    style="display: none;",
-                ),
                 id="perf-metrics-content",
                 cls="perf-metrics perf-metrics-collapsed",
+                style="display: none;"  # Hide entire metrics section when empty
             ),
             cls="perf-summary",
             id="perf-summary",
