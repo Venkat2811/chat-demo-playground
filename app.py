@@ -396,6 +396,7 @@ hdrs = (
             --baseline-color: #2563eb;
             --brrrllm-color: #fb923c;
             --panel-h: 300px; /* unified prompt/response panel height */
+            --metric-card-h: 210px; /* unified metric card height for expanded rows */
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -773,6 +774,9 @@ hdrs = (
             word-wrap: break-word;
         }
 
+        /* Keep request prompt area fixed height like response */
+        .prompt-section .content-text { height: var(--panel-h); max-height: var(--panel-h); overflow: auto; }
+
         /* Summary Stats */
         .summary-card {
             background: linear-gradient(135deg, #f8fafc, #f1f5f9);
@@ -913,6 +917,7 @@ hdrs = (
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 15px;
+            align-items: start; /* prevent stretching when right side grows */
         }
 
         .prompt-input-section,
@@ -1000,7 +1005,8 @@ hdrs = (
                 grid-template-columns: repeat(4, 1fr);
             }
             .metrics-row:nth-of-type(2) {
-                grid-template-columns: repeat(5, 1fr);
+                /* Keep second row aligned with the first */
+                grid-template-columns: repeat(4, 1fr);
             }
         }
 
@@ -1015,9 +1021,24 @@ hdrs = (
             white-space: normal;
             font-family: inherit;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-            gap: 12px;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 8px; /* tighter gap for top tiles */
         }
+
+        /* Make the collapsed top summary tiles more compact */
+        .perf-metrics .stat-item {
+            padding: 8px 10px;
+            min-height: 64px;
+            height: 64px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            overflow: hidden;
+        }
+
+        /* Compact labels and keep numbers tidy */
+        .perf-metrics .stats-grid .stat-label { font-size: 0.72rem; line-height: 1.05; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .perf-metrics .stats-grid .stat-value { font-size: 1.1rem; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 
         .metric-section {
             white-space: pre;
@@ -1036,7 +1057,13 @@ hdrs = (
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
             transition: all 0.2s ease;
             font-size: 0.85rem;
-            min-height: 110px;
+            height: var(--metric-card-h);
+            min-height: var(--metric-card-h);
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            align-items: flex-start;
+            overflow: hidden;
         }
 
         .metric-section-card:hover {
@@ -1044,14 +1071,11 @@ hdrs = (
             transform: translateY(-2px);
         }
 
-        .perf-metrics-collapsed {
-            max-height: none;
-            overflow: hidden;
-        }
-
-        .perf-metrics-expanded {
-            max-height: none;
-        }
+        /* Keep summary tiles visible; only hide expanded rows when collapsed */
+        .perf-metrics-collapsed { display: block; }
+        .perf-metrics-collapsed .metrics-row { display: none; }
+        .perf-metrics-expanded { display: block; max-height: none; }
+        .perf-metrics-expanded .metrics-row { display: grid; }
 
         .stat-item { cursor: pointer; }
 
@@ -1627,17 +1651,13 @@ async def run_batch(
             in_tok = int(payload.get("in_tokens", 0))
 
             if use_loaded:
-                # Reuse the pre-rendered prompt card response area. Place metrics above the
-                # scrollable output box by wrapping and putting the scroll class on the child.
+                # Update the pre-rendered dataset response area while keeping the
+                # visual height fixed. We intentionally avoid injecting per-request
+                # metrics here because that extra header changes the row height and
+                # causes the prompt/response tiles to grow.
                 outer_id = f"output-{req_id-1}"
                 html = (
                     f'<div id="{outer_id}" hx-swap-oob="outerHTML">'
-                    f'  <div class="request-metrics" style="margin-bottom:6px">'
-                    f'    <span class="metric-label">TTFT: </span><span class="metric-value" id="ttft-{tag}-{req_id}">--</span>'
-                    f'    <span class="metric-label" style="margin-left:10px">TPOT: </span><span class="metric-value" id="tpot-{tag}-{req_id}">--</span>'
-                    f'    <span class="metric-label" style="margin-left:10px">TPS: </span><span class="metric-value" id="tps-{tag}-{req_id}">--</span>'
-                    f'    <span class="metric-label" style="margin-left:10px">Tokens: </span><span class="metric-value" id="tokens-{tag}-{req_id}">0</span>'
-                    f'  </div>'
                     f'  <div class="output-area">'
                     f'    <div id="out-{tag}-{req_id}" class="content-text"></div>'
                     f'  </div>'
