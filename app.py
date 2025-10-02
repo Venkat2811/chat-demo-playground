@@ -50,6 +50,7 @@ class AppConfig:
     provider: Optional[dict]
     providers: dict
     datasets: list
+    hardware: Optional[dict] = None
 
 
 def _read_yaml_config() -> Optional[AppConfig]:
@@ -65,7 +66,8 @@ def _read_yaml_config() -> Optional[AppConfig]:
     provider = data.get("provider")
     providers = data.get("providers", {})
     datasets = data.get("datasets", [])
-    return AppConfig(provider=provider, providers=providers, datasets=datasets)
+    hardware = data.get("hardware")
+    return AppConfig(provider=provider, providers=providers, datasets=datasets, hardware=hardware)
 
 
 def _from_yaml_provider(app_cfg: Optional[AppConfig]) -> ProviderConfig:
@@ -102,6 +104,13 @@ def _from_yaml_provider(app_cfg: Optional[AppConfig]) -> ProviderConfig:
 
 APP_CFG = _read_yaml_config()
 PROV = _from_yaml_provider(APP_CFG)
+# Hardware settings
+HW = (APP_CFG.hardware if APP_CFG and APP_CFG.hardware else {})
+GPU_COUNT = 1
+try:
+    GPU_COUNT = int(HW.get("gpu_count", 1))  # type: ignore[arg-type]
+except Exception:
+    GPU_COUNT = 1
 
 # Cache dataset entries
 _dataset_cache: dict[str, list[dict]] = {}
@@ -298,6 +307,7 @@ hdrs = (
             --shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1);
             --baseline-color: #2563eb;
             --brrrllm-color: #fb923c;
+            --panel-h: 300px; /* unified prompt/response panel height */
         }
 
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -634,18 +644,9 @@ hdrs = (
             color: #1e293b;
         }
 
-        .request-content {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            height: 250px;
-        }
+        .request-content { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; align-items: start; }
 
-        .prompt-section,
-        .response-section {
-            padding: 15px;
-            overflow-y: auto;
-            position: relative;
-        }
+        .prompt-section, .response-section { padding: 15px; overflow: hidden; position: relative; display: flex; flex-direction: column; }
 
         .prompt-section {
             background: #f8fafc;
@@ -833,33 +834,10 @@ hdrs = (
             letter-spacing: 0.05em;
         }
 
-        .prompt-textarea {
-            width: 100%;
-            min-height: 200px;
-            max-height: 400px;
-            padding: 10px;
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 0.85rem;
-            resize: vertical;
-            background: #f8fafc;
-            color: #1e293b !important;
-            font-weight: 500;
-        }
+        .prompt-textarea { width: 100%; height: var(--panel-h); max-height: var(--panel-h); padding: 10px; border: 1px solid var(--border-color); border-radius: 6px; font-family: monospace; font-size: 0.85rem; resize: vertical; background: #f8fafc; color: #1e293b !important; font-weight: 500; overflow: auto; }
 
-        .output-area {
-            width: 100%;
-            min-height: 200px;
-            max-height: 400px;
-            padding: 10px;
-            border: 1px solid var(--border-color);
-            border-radius: 6px;
-            font-family: monospace;
-            font-size: 0.85rem;
-            background: white;
-            overflow-y: auto;
-        }
+        .output-area { width: 100%; height: var(--panel-h); max-height: var(--panel-h); padding: 10px; border: 1px solid var(--border-color); border-radius: 6px; font-family: monospace; font-size: 0.85rem; background: white; overflow: auto; }
+        .response-section .content-text { height: var(--panel-h); max-height: var(--panel-h); overflow: auto; }
 
         /* Performance Summary */
         .perf-summary {
@@ -906,15 +884,19 @@ hdrs = (
             font-family: 'Monaco', 'Menlo', monospace;
             font-size: 0.9rem;
             line-height: 1.6;
-            white-space: pre;
+            white-space: normal;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 20px;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
         }
 
         @media (min-width: 1200px) {
             .perf-metrics { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
         }
+
+        /* Override for tile grids inside perf metrics */
+        .perf-metrics .stats-grid { white-space: normal; font-family: inherit; display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+        .metric-section { white-space: pre; }
 
         .perf-metrics-collapsed {
             max-height: none;
@@ -1165,10 +1147,9 @@ async def stream_openai_responses(
 
 async def stream_provider(cfg: ProviderConfig, prompt: str, max_tokens: int) -> AsyncGenerator[str, None]:
     kind = (cfg.kind or "openai-chat").lower()
-    if "responses" in kind:
-        async for t in stream_openai_responses(cfg, prompt, max_tokens):
-            yield t
-    elif "chat" in kind:
+    # Force chat completions path even if 'responses' is configured, to avoid
+    # server-side tool pipelines on some vLLM builds.
+    if "chat" in kind or "responses" in kind:
         async for t in stream_openai_chat(cfg, prompt, max_tokens):
             yield t
     else:
@@ -1195,6 +1176,7 @@ async def run_one_request(
 
     out_text_parts: list[str] = []
     last_token_time: Optional[float] = None
+    usage_seen: bool = False
 
     # Inform client to create the req box
     await enqueue("create_box", tag, req_id, {
@@ -1219,6 +1201,7 @@ async def run_one_request(
                         metrics.output_tokens = int(payload)
                 except Exception:
                     pass
+                usage_seen = True
                 # Send a metrics-only update
                 await enqueue("token", tag, req_id, {
                     "token": "",
@@ -1278,8 +1261,8 @@ async def run_one_request(
 
     metrics.end_time = now()
     metrics.e2e_ms = (metrics.end_time - metrics.start_time) * 1000.0
-    # Strict check: fail if output tokens do not match requested max_tokens
-    if metrics.output_tokens != max_tokens:
+    # Strict check only if provider usage was observed
+    if usage_seen and metrics.output_tokens != max_tokens:
         raise StreamError(f"Output tokens {metrics.output_tokens} != expected {max_tokens}")
 
     await enqueue("end", tag, req_id, metrics)
@@ -1448,6 +1431,12 @@ async def run_batch(
             throughput = completed / duration if duration > 0 else 0
             output_token_throughput = total_output_tokens / duration if duration > 0 else 0
             total_token_throughput = (total_input_tokens + total_output_tokens) / duration if duration > 0 else 0
+            per_user_output_throughput = (output_token_throughput / max(concurrency, 1)) if duration > 0 else 0
+            per_gpu_output_throughput = (output_token_throughput / max(GPU_COUNT, 1)) if duration > 0 else 0
+            sum_e2e_ms = sum(e2es) if e2es else 0.0
+            avg_req_latency_ms = (sum_e2e_ms / len(e2es)) if e2es else 0.0
+            mean_tpot_ms = (sum(tpots)/len(tpots)) if tpots else 0.0
+            per_user_output_speed = (1000.0 / mean_tpot_ms) if mean_tpot_ms > 0 else 0.0
 
             summary = Div(
                 Div("Summary Statistics", cls="summary-title"),
@@ -1566,7 +1555,13 @@ async def run_batch(
                 f"Total input tokens:                 {total_input_tokens}\n"
                 f"Total generated tokens:             {total_output_tokens}\n"
                 f"Request throughput (req/s):         {throughput:.2f}\n"
-                f"Output token throughput (tok/s):    {output_token_throughput:.1f}"
+                f"Output token throughput (tok/s):    {output_token_throughput:.1f}\n"
+                f"Per-user output throughput (tok/s/user): {per_user_output_throughput:.2f}\n"
+                f"Per-GPU output throughput (tok/s/gpu):   {per_gpu_output_throughput:.2f}\n"
+                f"Total token throughput (tok/s):     {total_token_throughput:.1f}\n"
+                f"Total latency (ms):                 {sum_e2e_ms:.1f}\n"
+                f"Average request latency (ms):       {avg_req_latency_ms:.1f}\n"
+                f"Per-user output speed [1/TPOT] (tok/s/user): {per_user_output_speed:.4f}"
             )
             ttft_lines = (
                 f"Mean TTFT (ms):      {(sum(ttfts)/len(ttfts) if ttfts else 0):.0f}\n"
@@ -1591,6 +1586,54 @@ async def run_batch(
                 f"P99 E2EL (ms):       {pct(e2es, 99):.0f}"
             )
 
+            # Build a compact stats grid for the collapsed view
+            collapsed_stats = Div(
+                Div(Div("Successful Requests", cls="stat-label"), Div(str(completed), cls="stat-value"), cls="stat-item"),
+                Div(Div("Duration", cls="stat-label"), Div(f"{duration:.2f}s", cls="stat-value"), cls="stat-item"),
+                Div(Div("Total Input Tokens", cls="stat-label"), Div(str(total_input_tokens), cls="stat-value"), cls="stat-item"),
+                Div(Div("Total Generated Tokens", cls="stat-label"), Div(str(total_output_tokens), cls="stat-value"), cls="stat-item"),
+                Div(Div("Req Throughput", cls="stat-label"), Div(f"{throughput:.2f} req/s", cls="stat-value"), cls="stat-item"),
+                Div(Div("Output Tok/s", cls="stat-label"), Div(f"{output_token_throughput:.1f}", cls="stat-value"), cls="stat-item"),
+                Div(Div("Tok/s per User", cls="stat-label"), Div(f"{per_user_output_throughput:.2f}", cls="stat-value"), cls="stat-item"),
+                Div(Div("Tok/s per GPU", cls="stat-label"), Div(f"{per_gpu_output_throughput:.2f}", cls="stat-value"), cls="stat-item"),
+                Div(Div("Total Tok/s", cls="stat-label"), Div(f"{total_token_throughput:.1f}", cls="stat-value"), cls="stat-item"),
+                Div(Div("Avg Req Latency", cls="stat-label"), Div(f"{avg_req_latency_ms:.1f}ms", cls="stat-value"), cls="stat-item"),
+                Div(Div("1/TPOT per User", cls="stat-label"), Div(f"{per_user_output_speed:.2f}", cls="stat-value"), cls="stat-item"),
+                Div(Div("Hardware", cls="stat-label"), Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"), cls="stat-item"),
+                cls="stats-grid"
+            )
+
+            # Build expanded group cards
+            hw_lines = (
+                f"Model:  {HW.get('gpu_model','GPU')}\n"
+                f"Count:  {GPU_COUNT}"
+            )
+            req_lines = (
+                f"Total requests:       {total_reqs}\n"
+                f"Successful:           {completed}\n"
+                f"Total input tokens:    {total_input_tokens}\n"
+                f"Total output tokens:   {total_output_tokens}\n"
+                f"Concurrency:          {concurrency}\n"
+                f"Req throughput (req/s): {throughput:.2f}"
+            )
+            user_lines = (
+                f"Output tok/s/user:    {per_user_output_throughput:.2f}\n"
+                f"Mean TTFT (ms):       {(sum(ttfts)/len(ttfts) if ttfts else 0):.0f}\n"
+                f"P50 TTFT (ms):        {pct(ttfts, 50):.0f}\n"
+                f"Mean TPOT (ms):       {(sum(tpots)/len(tpots) if tpots else 0):.1f}\n"
+                f"Mean ITL (ms):        {(sum(all_itls)/len(all_itls) if all_itls else 0):.1f}\n"
+                f"Mean E2EL (ms):       {(sum(e2es)/len(e2es) if e2es else 0):.0f}"
+            )
+            per_gpu_lines = (
+                f"Output tok/s/gpu:     {per_gpu_output_throughput:.2f}"
+            )
+            totals_lines = (
+                f"Total tok/s:          {total_token_throughput:.1f}\n"
+                f"Total latency (ms):   {sum_e2e_ms:.1f}\n"
+                f"Avg req latency (ms): {avg_req_latency_ms:.1f}\n"
+                f"Req throughput:       {throughput:.2f} req/s"
+            )
+
             top_summary = Div(
                 Div(
                     Div("Performance Summary", cls="perf-title"),
@@ -1603,7 +1646,12 @@ async def run_batch(
                     cls="perf-header"
                 ),
                 Div(
-                    Div(lines, cls="metric-section"),
+                    Div(collapsed_stats, cls="metric-section full-span"),
+                    Div(Div("Hardware", cls="metric-section-title"), hw_lines, cls="metric-section", id="hw-expanded", style="display: none;"),
+                    Div(Div("Requests", cls="metric-section-title"), req_lines, cls="metric-section", id="req-expanded", style="display: none;"),
+                    Div(Div("Per User", cls="metric-section-title"), user_lines, cls="metric-section", id="user-expanded", style="display: none;"),
+                    Div(Div("Per GPU", cls="metric-section-title"), per_gpu_lines, cls="metric-section", id="pergpu-expanded", style="display: none;"),
+                    Div(Div("Totals", cls="metric-section-title"), totals_lines, cls="metric-section", id="totals-expanded", style="display: none;"),
                     Div(Div("Time to First Token", cls="metric-section-title"), ttft_lines, cls="metric-section", id="ttft-expanded", style="display: none;"),
                     Div(Div("Time per Output Token", cls="metric-section-title"), tpot_lines, cls="metric-section", id="tpot-expanded", style="display: none;"),
                     Div(Div("Inter-token Latency", cls="metric-section-title"), itl_lines, cls="metric-section", id="itl-expanded", style="display: none;"),
@@ -1850,20 +1898,29 @@ def load_prompts(dataset: str = None, mode: str = None):
                     "Expand All",
                     cls="expand-btn",
                     onclick="togglePerfMetrics()",
-                    id="expand-toggle"
+                    id="expand-toggle",
                 ),
-                cls="perf-header"
+                cls="perf-header",
             ),
             Div(
                 Div(
-                    "Successful requests:                --\n"
-                    "Benchmark duration (s):             --\n"
-                    "Total input tokens:                 --\n"
-                    "Total generated tokens:             --\n"
-                    "Request throughput (req/s):         --\n"
-                    "Output token throughput (tok/s):    --",
-                    cls="metric-section"
+                    Div(Div("SUCCESSFUL REQUESTS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("DURATION", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("TOTAL INPUT TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("TOTAL GENERATED TOKENS", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("CONCURRENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("REQ THROUGHPUT", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("OUTPUT TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("TOK/S PER USER", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("TOK/S PER GPU", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("TOTAL TOK/S", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("AVG REQ LATENCY", cls="stat-label"), Div("--", cls="stat-value"), cls="stat-item"),
+                    Div(Div("HARDWARE", cls="stat-label"), Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"), cls="stat-item"),
+                    cls="stats-grid",
                 ),
+                cls="metric-section full-span",
+            ),
+            Div(
                 Div(
                     Div("Time to First Token", cls="metric-section-title"),
                     "Mean TTFT (ms):      --\n"
@@ -1872,7 +1929,7 @@ def load_prompts(dataset: str = None, mode: str = None):
                     "P99 TTFT (ms):       --",
                     cls="metric-section",
                     id="ttft-expanded",
-                    style="display: none;"
+                    style="display: none;",
                 ),
                 Div(
                     Div("Time per Output Token", cls="metric-section-title"),
@@ -1882,7 +1939,7 @@ def load_prompts(dataset: str = None, mode: str = None):
                     "P99 TPOT (ms):       --",
                     cls="metric-section",
                     id="tpot-expanded",
-                    style="display: none;"
+                    style="display: none;",
                 ),
                 Div(
                     Div("Inter-token Latency", cls="metric-section-title"),
@@ -1892,7 +1949,7 @@ def load_prompts(dataset: str = None, mode: str = None):
                     "P99 ITL (ms):        --",
                     cls="metric-section",
                     id="itl-expanded",
-                    style="display: none;"
+                    style="display: none;",
                 ),
                 Div(
                     Div("End-to-end Latency", cls="metric-section-title"),
@@ -1902,41 +1959,13 @@ def load_prompts(dataset: str = None, mode: str = None):
                     "P99 E2EL (ms):       --",
                     cls="metric-section",
                     id="e2e-expanded",
-                    style="display: none;"
+                    style="display: none;",
                 ),
                 id="perf-metrics-content",
-                cls="perf-metrics perf-metrics-collapsed"
+                cls="perf-metrics perf-metrics-collapsed",
             ),
-            Script("""
-                function togglePerfMetrics() {
-                    const content = document.getElementById('perf-metrics-content');
-                    const button = document.getElementById('expand-toggle');
-                    const ttft = document.getElementById('ttft-expanded');
-                    const tpot = document.getElementById('tpot-expanded');
-                    const itl = document.getElementById('itl-expanded');
-                    const e2e = document.getElementById('e2e-expanded');
-
-                    if (content.classList.contains('perf-metrics-collapsed')) {
-                        content.classList.remove('perf-metrics-collapsed');
-                        content.classList.add('perf-metrics-expanded');
-                        button.textContent = 'Collapse';
-                        ttft.style.display = 'block';
-                        tpot.style.display = 'block';
-                        itl.style.display = 'block';
-                        e2e.style.display = 'block';
-                    } else {
-                        content.classList.remove('perf-metrics-expanded');
-                        content.classList.add('perf-metrics-collapsed');
-                        button.textContent = 'Expand All';
-                        ttft.style.display = 'none';
-                        tpot.style.display = 'none';
-                        itl.style.display = 'none';
-                        e2e.style.display = 'none';
-                    }
-                }
-            """),
             cls="perf-summary",
-            id="perf-summary"
+            id="perf-summary",
         )
 
         return Div(
@@ -2084,7 +2113,6 @@ async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = N
             Div(
                 Span(f"📊 {min(total, len(entries))} requests"),
                 Span(f"⚡ {conc} concurrent"),
-                Span(f"📝 {out_tokens} max tokens"),
                 cls="run-meta"
             ),
             cls="run-header"

@@ -5,6 +5,10 @@ provider:
   api_key: null
   force_output_tokens: false  # set true for vLLM servers to enforce exact output token length
 
+hardware:
+  gpu_model: H100 80GB SXM
+  gpu_count: 2
+
 datasets:
   - name: sharegpt_1k
     path: /absolute/path/to/sharegpt_1k.jsonl
