@@ -992,6 +992,7 @@ hdrs = (
             grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
             gap: 12px;
             width: 100%;
+            align-items: stretch;
         }
 
         @media (min-width: 768px) {
@@ -1035,7 +1036,7 @@ hdrs = (
             box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
             transition: all 0.2s ease;
             font-size: 0.85rem;
-            min-height: 100px;
+            min-height: 110px;
         }
 
         .metric-section-card:hover {
@@ -1880,31 +1881,33 @@ async def run_batch(
                 f"Per-user output speed [1/TPOT] (tok/s/user): {per_user_output_speed:.4f}"
             )
             ttft_lines = (
-                f"Mean TTFT (ms):      {(sum(ttfts)/len(ttfts) if ttfts else 0):>8.0f}\n"
-                f"Median TTFT (ms):    {pct(ttfts, 50):>8.0f}\n"
-                f"P90 TTFT (ms):       {pct(ttfts, 90):>8.0f}\n"
-                f"P99 TTFT (ms):       {pct(ttfts, 99):>8.0f}"
+                f"Mean TTFT (ms):          {(sum(ttfts)/len(ttfts) if ttfts else 0):>10.0f}\n"
+                f"Median TTFT (ms):        {pct(ttfts, 50):>10.0f}\n"
+                f"P90 TTFT (ms):           {pct(ttfts, 90):>10.0f}\n"
+                f"P99 TTFT (ms):           {pct(ttfts, 99):>10.0f}"
             )
             tpot_lines = (
-                f"Mean TPOT (ms):      {(sum(tpots)/len(tpots) if tpots else 0):>8.1f}\n"
-                f"Median TPOT (ms):    {pct(tpots, 50):>8.1f}\n"
-                f"P90 TPOT (ms):       {pct(tpots, 90):>8.1f}"
+                f"Mean TPOT (ms):          {(sum(tpots)/len(tpots) if tpots else 0):>10.1f}\n"
+                f"Median TPOT (ms):        {pct(tpots, 50):>10.1f}\n"
+                f"P90 TPOT (ms):           {pct(tpots, 90):>10.1f}\n"
+                f"P99 TPOT (ms):           {pct(tpots, 99):>10.1f}"
             )
             itl_lines = (
-                f"Mean ITL (ms):       {(sum(all_itls)/len(all_itls) if all_itls else 0):>8.1f}\n"
-                f"Median ITL (ms):     {pct(all_itls, 50):>8.1f}\n"
-                f"P90 ITL (ms):        {pct(all_itls, 90):>8.1f}"
+                f"Mean ITL (ms):           {(sum(all_itls)/len(all_itls) if all_itls else 0):>10.1f}\n"
+                f"Median ITL (ms):         {pct(all_itls, 50):>10.1f}\n"
+                f"P90 ITL (ms):            {pct(all_itls, 90):>10.1f}\n"
+                f"P99 ITL (ms):            {pct(all_itls, 99):>10.1f}"
             )
             e2e_lines = (
-                f"Mean E2EL (ms):      {(sum(e2es)/len(e2es) if e2es else 0):>8.0f}\n"
-                f"Median E2EL (ms):    {pct(e2es, 50):>8.0f}\n"
-                f"P90 E2EL (ms):       {pct(e2es, 90):>8.0f}\n"
-                f"P99 E2EL (ms):       {pct(e2es, 99):>8.0f}"
+                f"Mean E2EL (ms):          {(sum(e2es)/len(e2es) if e2es else 0):>10.0f}\n"
+                f"Median E2EL (ms):        {pct(e2es, 50):>10.0f}\n"
+                f"P90 E2EL (ms):           {pct(e2es, 90):>10.0f}\n"
+                f"P99 E2EL (ms):           {pct(e2es, 99):>10.0f}"
             )
 
-            # Build a compact stats grid for the collapsed view
+            # Build a compact stats grid for the collapsed view (10 items total)
             collapsed_stats = Div(
-                # Put Hardware first
+                # Row 1 - First 5 items (reordered per request)
                 Div(
                     Div("Hardware", cls="stat-label"),
                     Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"),
@@ -1913,25 +1916,7 @@ async def run_batch(
                 ),
                 Div(
                     Div("Successful Requests", cls="stat-label"),
-                    Div(str(completed), cls="stat-value"),
-                    cls="stat-item",
-                    onclick="openGroupPopup('req-expanded','Requests')"
-                ),
-                Div(
-                    Div("Duration", cls="stat-label"),
-                    Div(f"{duration:.2f}s", cls="stat-value"),
-                    cls="stat-item",
-                    onclick="openGroupPopup('req-expanded','Requests')"
-                ),
-                Div(
-                    Div("Total Input Tokens", cls="stat-label"),
-                    Div(str(total_input_tokens), cls="stat-value"),
-                    cls="stat-item",
-                    onclick="openGroupPopup('req-expanded','Requests')"
-                ),
-                Div(
-                    Div("Total Generated Tokens", cls="stat-label"),
-                    Div(str(total_output_tokens), cls="stat-value"),
+                    Div(f"{completed:,}", cls="stat-value"),
                     cls="stat-item",
                     onclick="openGroupPopup('req-expanded','Requests')"
                 ),
@@ -1942,46 +1927,47 @@ async def run_batch(
                     onclick="openGroupPopup('req-expanded','Requests')"
                 ),
                 Div(
-                    Div("Req Throughput", cls="stat-label"),
-                    Div(f"{throughput:.2f} req/s", cls="stat-value"),
+                    Div("Output Tok/s", cls="stat-label"),
+                    Div(f"{output_token_throughput:,.1f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('throughput-expanded','Throughput')"
+                ),
+                Div(
+                    Div("Tok/s per GPU", cls="stat-label"),
+                    Div(f"{per_gpu_output_throughput:,.2f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('throughput-expanded','Throughput')"
+                ),
+                # Row 2 - Remaining items
+                Div(
+                    Div("Total Tok/s", cls="stat-label"),
+                    Div(f"{total_token_throughput:,.1f}", cls="stat-value"),
+                    cls="stat-item",
+                    onclick="openGroupPopup('throughput-expanded','Throughput')"
+                ),
+                Div(
+                    Div("Total Input Tokens", cls="stat-label"),
+                    Div(f"{total_input_tokens:,}", cls="stat-value"),
                     cls="stat-item",
                     onclick="openGroupPopup('req-expanded','Requests')"
                 ),
                 Div(
-                    Div("Output Tok/s", cls="stat-label"),
-                    Div(f"{output_token_throughput:.1f}", cls="stat-value"),
+                    Div("Total Generated Tokens", cls="stat-label"),
+                    Div(f"{total_output_tokens:,}", cls="stat-value"),
                     cls="stat-item",
-                    onclick="openGroupPopup('totals-expanded','Totals')"
+                    onclick="openGroupPopup('req-expanded','Requests')"
                 ),
                 Div(
-                    Div("Tok/s per User", cls="stat-label"),
-                    Div(f"{per_user_output_throughput:.2f}", cls="stat-value"),
+                    Div("Duration", cls="stat-label"),
+                    Div(f"{duration:.2f}s", cls="stat-value"),
                     cls="stat-item",
-                    onclick="openGroupPopup('user-expanded','Per User')"
+                    onclick="openGroupPopup('req-expanded','Requests')"
                 ),
                 Div(
-                    Div("Tok/s per GPU", cls="stat-label"),
-                    Div(f"{per_gpu_output_throughput:.2f}", cls="stat-value"),
+                    Div("Req Throughput", cls="stat-label"),
+                    Div(f"{throughput:.2f} req/s", cls="stat-value"),
                     cls="stat-item",
-                    onclick="openGroupPopup('pergpu-expanded','Per GPU')"
-                ),
-                Div(
-                    Div("Total Tok/s", cls="stat-label"),
-                    Div(f"{total_token_throughput:.1f}", cls="stat-value"),
-                    cls="stat-item",
-                    onclick="openGroupPopup('totals-expanded','Totals')"
-                ),
-                Div(
-                    Div("Avg Req Latency", cls="stat-label"),
-                    Div(f"{avg_req_latency_ms:.1f}ms", cls="stat-value"),
-                    cls="stat-item",
-                    onclick="openGroupPopup('totals-expanded','Totals')"
-                ),
-                Div(
-                    Div("1/TPOT per User", cls="stat-label"),
-                    Div(f"{per_user_output_speed:.2f}", cls="stat-value"),
-                    cls="stat-item",
-                    onclick="openGroupPopup('user-expanded','Per User')"
+                    onclick="openGroupPopup('req-expanded','Requests')"
                 ),
                 cls="stats-grid"
             )
@@ -1992,36 +1978,32 @@ async def run_batch(
                 f"Count:  {GPU_COUNT:>3}"
             )
             req_lines = (
-                f"Total requests:      {total_reqs:>8}\n"
-                f"Successful:          {completed:>8}\n"
-                f"Total input tokens:  {total_input_tokens:>8}\n"
-                f"Total output tokens: {total_output_tokens:>8}\n"
-                f"Concurrency:         {concurrency:>8}\n"
-                f"Req throughput (req/s): {throughput:>5.2f}"
+                f"Total requests:          {total_reqs:>10,}\n"
+                f"Successful:              {completed:>10,}\n"
+                f"Total input tokens:      {total_input_tokens:>10,}\n"
+                f"Total output tokens:     {total_output_tokens:>10,}\n"
+                f"Concurrency:             {concurrency:>10}\n"
+                f"Req throughput (req/s):  {throughput:>10.2f}"
             )
-            # New Throughput section with all token metrics
+            # Throughput section without per-user metric
             duration_s = duration if duration > 0 else 1  # duration is already in seconds
             throughput_lines = (
-                f"Input tok/s:         {(total_input_tokens / duration_s):>8.1f}\n"
-                f"Output tok/s:        {output_token_throughput:>8.1f}\n"
-                f"Total tok/s:         {total_token_throughput:>8.1f}\n"
-                f"Output tok/s/user:   {per_user_output_throughput:>8.2f}\n"
-                f"Output tok/s/gpu:    {per_gpu_output_throughput:>8.2f}\n"
-                f"Req throughput:      {throughput:>8.2f} req/s"
+                f"Input tok/s:              {(total_input_tokens / duration_s):>10,.1f}\n"
+                f"Output tok/s:             {output_token_throughput:>10,.1f}\n"
+                f"Total tok/s:              {total_token_throughput:>10,.1f}\n"
+                f"Output tok/s/gpu:         {per_gpu_output_throughput:>10,.2f}\n"
+                f"Req throughput:           {throughput:>10.2f} req/s"
             )
 
-            # Per User section
+            # Per User section with output tok/s/user
             per_user_lines = (
-                f"Mean TTFT (ms):      {(sum(ttfts)/len(ttfts) if ttfts else 0):>8.0f}\n"
-                f"Mean TPOT (ms):      {(sum(tpots)/len(tpots) if tpots else 0):>8.1f}\n"
-                f"Mean ITL (ms):       {(sum(all_itls)/len(all_itls) if all_itls else 0):>8.1f}\n"
-                f"Mean E2EL (ms):      {(sum(e2es)/len(e2es) if e2es else 0):>8.0f}"
+                f"Mean TTFT (ms):          {(sum(ttfts)/len(ttfts) if ttfts else 0):>10,.0f}\n"
+                f"Mean TPOT (ms):          {(sum(tpots)/len(tpots) if tpots else 0):>10.1f}\n"
+                f"Mean ITL (ms):           {(sum(all_itls)/len(all_itls) if all_itls else 0):>10.1f}\n"
+                f"Mean E2EL (ms):          {(sum(e2es)/len(e2es) if e2es else 0):>10,.0f}\n"
+                f"Output tok/s/user:       {per_user_output_throughput:>10.2f}"
             )
 
-            totals_lines = (
-                f"Total latency (ms):  {sum_e2e_ms:>10.1f}\n"
-                f"Avg req latency (ms):{avg_req_latency_ms:>10.1f}"
-            )
 
             top_summary = Div(
                 Div(
@@ -2039,7 +2021,7 @@ async def run_batch(
                     # Main collapsed summary at the top (full width)
                     Div(collapsed_stats, cls="metric-section full-span"),
 
-                    # First row: Hardware, Throughput, Requests, Per User/GPU
+                    # First row: Hardware, Throughput, Requests, Time to First Token
                     Div(
                         Div(
                             Div("Hardware", cls="metric-section-title clickable", onclick="openGroupPopup('hw-expanded','Hardware')"),
@@ -2054,21 +2036,17 @@ async def run_batch(
                             req_lines, cls="metric-section-card", id="req-expanded", style="display: none;"
                         ),
                         Div(
-                            Div("Per User", cls="metric-section-title clickable", onclick="openGroupPopup('user-expanded','Per User')"),
-                            per_user_lines, cls="metric-section-card", id="user-expanded", style="display: none;"
+                            Div("Time to First Token", cls="metric-section-title clickable", onclick="openGroupPopup('ttft-expanded','Time to First Token')"),
+                            ttft_lines, cls="metric-section-card", id="ttft-expanded", style="display: none;"
                         ),
                         cls="metrics-row"
                     ),
 
-                    # Second row: Totals and timing metrics
+                    # Second row: Per User and other timing metrics (removed Totals)
                     Div(
                         Div(
-                            Div("Totals", cls="metric-section-title clickable", onclick="openGroupPopup('totals-expanded','Totals')"),
-                            totals_lines, cls="metric-section-card", id="totals-expanded", style="display: none;"
-                        ),
-                        Div(
-                            Div("Time to First Token", cls="metric-section-title clickable", onclick="openGroupPopup('ttft-expanded','Time to First Token')"),
-                            ttft_lines, cls="metric-section-card", id="ttft-expanded", style="display: none;"
+                            Div("Per User", cls="metric-section-title clickable", onclick="openGroupPopup('user-expanded','Per User')"),
+                            per_user_lines, cls="metric-section-card", id="user-expanded", style="display: none;"
                         ),
                         Div(
                             Div("Time per Output Token", cls="metric-section-title clickable", onclick="openGroupPopup('tpot-expanded','Time per Output Token')"),
@@ -2513,6 +2491,24 @@ def load_run_modes(dataset: str = None):
                 "1421 Requests - 203×7 (200 Concurrent)",
                 cls="radio-label"
             ),
+            Label(
+                Input(type="radio", name="mode", value="1421x220",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (220 Concurrent)",
+                cls="radio-label"
+            ),
+            Label(
+                Input(type="radio", name="mode", value="1421x240",
+                      hx_post="/load_prompts",
+                      hx_target="#prompts-container",
+                      hx_trigger="change",
+                      hx_include="#controls"),
+                "1421 Requests - 203×7 (240 Concurrent)",
+                cls="radio-label"
+            ),
             cls="radio-group"
         )
     else:
@@ -2604,6 +2600,10 @@ def _parse_mode(mode: str) -> tuple[int, int]:
         return 1421, 180
     if m == "1421x200":
         return 1421, 200
+    if m == "1421x220":
+        return 1421, 220
+    if m == "1421x240":
+        return 1421, 240
     return 1, 1
 
 
