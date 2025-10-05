@@ -767,6 +767,11 @@ hdrs = (
             padding-bottom: 5px;
         }
 
+        /* Inline metrics next to RESPONSE label */
+        .inline-metrics { display: flex; align-items: center; gap: 10px; font-family: 'Monaco', 'Menlo', monospace; font-size: 0.8rem; color: #334155; }
+        .inline-metrics .metric-label { color: var(--text-muted); }
+        .inline-metrics .metric-value { font-weight: 700; color: #1e293b; }
+
         .content-text {
             font-size: 0.9rem;
             line-height: 1.5;
@@ -1651,30 +1656,35 @@ async def run_batch(
             in_tok = int(payload.get("in_tokens", 0))
 
             if use_loaded:
-                # Update the pre-rendered dataset response area while keeping the
-                # visual height fixed. We intentionally avoid injecting per-request
-                # metrics here because that extra header changes the row height and
-                # causes the prompt/response tiles to grow.
+                # Update two pre-rendered regions:
+                # 1) Replace the response content container so we can stream into
+                #    id="out-{tag}-{req_id}" without altering height.
+                # 2) Populate the inline metrics placeholder next to the RESPONSE
+                #    label with spans that will receive live updates.
                 outer_id = f"output-{req_id-1}"
-                html = (
+                metrics_host = f"metrics-{req_id-1}"
+
+                parts = []
+                parts.append(
                     f'<div id="{outer_id}" hx-swap-oob="outerHTML">'
                     f'  <div class="output-area">'
                     f'    <div id="out-{tag}-{req_id}" class="content-text"></div>'
                     f'  </div>'
                     f'</div>'
                 )
-                return html
+                parts.append(
+                    f'<div id="{metrics_host}" class="inline-metrics" hx-swap-oob="outerHTML">'
+                    f'  <div class="metric"><span class="metric-label">TTFT:</span> <span class="metric-value" id="ttft-{tag}-{req_id}">--</span></div>'
+                    f'  <div class="metric"><span class="metric-label">TPOT:</span> <span class="metric-value" id="tpot-{tag}-{req_id}">--</span></div>'
+                    f'  <div class="metric"><span class="metric-label">TPS:</span>  <span class="metric-value" id="tps-{tag}-{req_id}">--</span></div>'
+                    f'  <div class="metric"><span class="metric-label">Tokens:</span> <span class="metric-value" id="tokens-{tag}-{req_id}">0</span></div>'
+                    f'</div>'
+                )
+                return "".join(parts)
             else:
                 box = Div(
                     Div(
                         Div(f"Request #{req_id}", cls="request-number"),
-                        Div(
-                            Div(Span("TTFT: ", cls="metric-label"), Span("--", id=f"ttft-{tag}-{req_id}", cls="metric-value"), cls="metric"),
-                            Div(Span("TPOT: ", cls="metric-label"), Span("--", id=f"tpot-{tag}-{req_id}", cls="metric-value"), cls="metric"),
-                            Div(Span("TPS: ", cls="metric-label"), Span("--", id=f"tps-{tag}-{req_id}", cls="metric-value"), cls="metric"),
-                            Div(Span("Tokens: ", cls="metric-label"), Span("0", id=f"tokens-{tag}-{req_id}", cls="metric-value"), cls="metric"),
-                            cls="request-metrics"
-                        ),
                         cls="request-header"
                     ),
                     Div(
@@ -1684,7 +1694,17 @@ async def run_batch(
                             cls="prompt-section"
                         ),
                         Div(
-                            Div("RESPONSE", cls="section-label"),
+                            Div(
+                                Span("RESPONSE", cls="section-label"),
+                                Div(
+                                    Div(Span("TTFT: ", cls="metric-label"), Span("--", id=f"ttft-{tag}-{req_id}", cls="metric-value"), cls="metric"),
+                                    Div(Span("TPOT: ", cls="metric-label"), Span("--", id=f"tpot-{tag}-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("TPS: ", cls="metric-label"), Span("--", id=f"tps-{tag}-{req_id}", cls="metric-value"), cls="metric"),
+                                    Div(Span("Tokens: ", cls="metric-label"), Span("0", id=f"tokens-{tag}-{req_id}", cls="metric-value"), cls="metric"),
+                                    cls="inline-metrics"
+                                ),
+                                style="display:flex; align-items:center; justify-content: space-between; gap:8px;"
+                            ),
                             Div(id=f"out-{tag}-{req_id}", cls="content-text"),
                             cls="response-section"
                         ),
@@ -2355,7 +2375,11 @@ def load_prompts(dataset: str = None, mode: str = None):
                         cls="prompt-input-section"
                     ),
                     Div(
-                        Div("RESPONSE", cls="section-title"),
+                        Div(
+                            Span("RESPONSE", cls="section-title"),
+                            Div(id=f"metrics-{i}", cls="inline-metrics"),
+                            style="display:flex; align-items:center; justify-content: space-between; gap:8px;"
+                        ),
                         Div(
                             id=f"output-{i}",
                             cls="output-area"
