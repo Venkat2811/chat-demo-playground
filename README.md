@@ -1,6 +1,6 @@
 # chat-demo-playground
 
-Local UI to run one provider, stream responses, and show simple benchmark-style metrics.
+Local UI to run A/B side-by-side against two OpenAI-compatible providers with a single mode (25 concurrent). Streams responses and shows simple per-request metrics.
 
 ## Quick start
 
@@ -14,8 +14,10 @@ Local UI to run one provider, stream responses, and show simple benchmark-style 
 
 3) Configure via YAML (preferred):
 
-   - Copy `config.example.yaml` to `config.yaml` and edit the single `provider` and any `datasets`.
-   - The provider must be OpenAI-compatible (`/v1/chat/completions` or `/v1/completions`).
+   - Copy `config.example.yaml` to `config.yaml`.
+   - Option A: set a single `provider:` block (used for both A and B).
+   - Option B: set `providers:` with `A:` and `B:` blocks to compare two distinct providers.
+   - Providers must be OpenAI-compatible (`/v1/chat/completions` or `/v1/completions`; `openai-responses` also supported).
    - Datasets expect JSONL with a `prompt_field` (and optionally `token_len_field`).
 
 4) Run the app:
@@ -24,13 +26,9 @@ Local UI to run one provider, stream responses, and show simple benchmark-style 
 
 ## UI & behavior
 
-- Shared controls: dataset picker (+ Random sample), prompt (editable), input token target (auto-filled from sample if available), max output tokens, and run mode selector.
-- Single provider. One Run button. Output area is scrollable.
-- Modes: Single, 10 req (concurrency 1), 50 req (concurrency 10).
-- Layout:
-  - Single request: shows one Prompt section and one streaming Response under it.
-  - Multi-request: stacks multiple Prompt/Response pairs, each streams independently.
-- Per-request headers show TTFT, E2EL, mean ITL, and output token count (approx). A summary block mimics vLLM benchmark formatting.
+- Controls: dataset picker (+ sample), prompt preview, output tokens, and a single run mode: "A/B Side-by-Side (25 concurrent)".
+- A single Run button launches 25 concurrent requests; each request fans out to provider A and B with the same prompt.
+- Each request card shows two response panes (A and B) streaming independently with live TTFT/TPOT/TPS/token counts.
 
 Notes:
 

@@ -1,9 +1,27 @@
+# Either configure a single `provider:` (used for both A and B),
+# or explicitly configure two providers under `providers:` keys A and B.
+
 provider:
   base_url: http://127.0.0.1:8000/v1
   model: your-model-name
-  kind: openai-chat   # or: openai-completions
+  kind: openai-chat   # or: openai-completions or openai-responses
   api_key: null
   force_output_tokens: false  # set true for vLLM servers to enforce exact output token length
+
+# Example A/B providers (optional)
+# providers:
+#   A:
+#     base_url: http://provider-a-host:8000/v1
+#     model: model-a
+#     kind: openai-chat
+#     api_key: null
+#     force_output_tokens: false
+#   B:
+#     base_url: http://provider-b-host:8000/v1
+#     model: model-b
+#     kind: openai-chat
+#     api_key: null
+#     force_output_tokens: false
 
 hardware:
   gpu_model: H100 80GB SXM

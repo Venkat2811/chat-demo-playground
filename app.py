@@ -104,6 +104,32 @@ def _from_yaml_provider(app_cfg: Optional[AppConfig]) -> ProviderConfig:
 
 APP_CFG = _read_yaml_config()
 PROV = _from_yaml_provider(APP_CFG)
+
+# Support two providers (A, B) for side-by-side mode
+def _from_yaml_providers(app_cfg: Optional[AppConfig]) -> tuple[ProviderConfig, ProviderConfig]:
+    # Helper to create ProviderConfig
+    def mk(name: str, node: dict) -> ProviderConfig:
+        return ProviderConfig(
+            name=name,
+            base_url=str(node.get("base_url", "http://86.38.238.33:8000/v1")),
+            api_key=node.get("api_key"),
+            model=str(node.get("model", "openai/gpt-oss-120b")),
+            kind=str(node.get("kind", "openai-chat")),
+            force_output_tokens=bool(node.get("force_output_tokens", False)),
+        )
+
+    if app_cfg and app_cfg.providers:
+        prov_a = mk("A", app_cfg.providers.get("A", app_cfg.providers.get("a", app_cfg.provider or {})))
+        prov_b = mk("B", app_cfg.providers.get("B", app_cfg.providers.get("b", app_cfg.provider or {})))
+        return prov_a, prov_b
+
+    # Fallback: duplicate single provider
+    base = _from_yaml_provider(app_cfg)
+    a = ProviderConfig("A", base.base_url, base.api_key, base.model, base.kind, base.force_output_tokens)
+    b = ProviderConfig("B", base.base_url, base.api_key, base.model, base.kind, base.force_output_tokens)
+    return a, b
+
+PROV_A, PROV_B = _from_yaml_providers(APP_CFG)
 # Hardware settings
 HW = (APP_CFG.hardware if APP_CFG and APP_CFG.hardware else {})
 GPU_COUNT = 1
@@ -742,6 +768,8 @@ hdrs = (
         }
 
         .request-content { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; align-items: start; }
+        /* A/B layout: prompt small on the left, two large response columns */
+        .request-content.ab-layout { grid-template-columns: minmax(220px, 0.7fr) 1fr 1fr; }
 
         .prompt-section, .response-section { padding: 15px; overflow: hidden; position: relative; display: flex; flex-direction: column; }
 
@@ -781,6 +809,10 @@ hdrs = (
 
         /* Keep request prompt area fixed height like response */
         .prompt-section .content-text { height: var(--panel-h); max-height: var(--panel-h); overflow: auto; }
+        /* Smaller prompt for A/B cards */
+        .prompt-section.prompt-small .content-text { height: 140px; max-height: 140px; }
+        /* Smaller prompt input in controls */
+        .control-panel .prompt-textarea { height: 120px; max-height: 120px; }
 
         /* Summary Stats */
         .summary-card {
@@ -944,6 +976,8 @@ hdrs = (
 
         .output-area { width: 100%; height: var(--panel-h); max-height: var(--panel-h); padding: 10px; border: 1px solid var(--border-color); border-radius: 6px; font-family: monospace; font-size: 0.85rem; background: white; overflow: auto; }
         .response-section .content-text { height: var(--panel-h); max-height: var(--panel-h); overflow: auto; }
+        /* Larger response panes for A/B */
+        .ab-layout .response-section .content-text { height: 420px; max-height: 420px; }
 
         /* Performance Summary */
         .perf-summary {
@@ -2172,15 +2206,300 @@ async def run_batch(
             continue
 
 
+# ---------- A/B side-by-side batch runner ----------
+
+async def run_ab_batch(
+    cfg_a: ProviderConfig,
+    cfg_b: ProviderConfig,
+    dataset_entries: list[dict],
+    ds_config: DatasetConfig | None,
+    out_tokens: int,
+    total_reqs: int,
+    concurrency: int,
+    tag: str,
+) -> AsyncGenerator[bytes, None]:
+    """Run the same prompt through two providers (A and B) side-by-side.
+
+    Creates one request card per entry with two response panes that stream independently.
+    """
+
+    queue: asyncio.Queue[tuple[str, str, int, Any]] = asyncio.Queue()
+    batch_start = now()
+
+    # We track metrics per provider
+    metrics_lock = asyncio.Lock()
+    all_metrics_a: list[RequestMetrics] = []
+    all_metrics_b: list[RequestMetrics] = []
+
+    async def enqueue(kind: str, tag: str, req_id: int, payload: Any):
+        await queue.put((kind, tag, req_id, payload))
+
+    async def run_one_request_ab(
+        provider_label: str,
+        cfg: ProviderConfig,
+        prompt: str,
+        expected_response: str,
+        in_tokens: int,
+        max_tokens: int,
+        tag: str,
+        req_id: int,
+    ) -> RequestMetrics:
+        metrics = RequestMetrics(request_id=req_id, start_time=now())
+        out_text_parts: list[str] = []
+        last_token_time: Optional[float] = None
+        usage_seen: bool = False
+        metrics.input_tokens = in_tokens
+
+        try:
+            async for tok in stream_provider(cfg, prompt, max_tokens):
+                if tok.startswith("\x00USAGE:"):
+                    try:
+                        payload = tok.split(":", 1)[1]
+                        if "," in payload:
+                            out_str, in_str = payload.split(",", 1)
+                            metrics.output_tokens = int(out_str)
+                            metrics.input_tokens = int(in_str)
+                        else:
+                            metrics.output_tokens = int(payload)
+                    except Exception:
+                        pass
+                    usage_seen = True
+                    await enqueue("token", tag, req_id, {
+                        "provider": provider_label,
+                        "token": "",
+                        "metrics": {
+                            "ttft_ms": metrics.ttft_ms,
+                            "tpot_ms": metrics.tpot_ms,
+                            "tps": metrics.tps,
+                            "tokens": metrics.output_tokens,
+                            "in_tokens": metrics.input_tokens,
+                        }
+                    })
+                    continue
+
+                t = now()
+                if metrics.first_token_time is None:
+                    metrics.first_token_time = t
+                    metrics.ttft_ms = (t - metrics.start_time) * 1000.0
+                else:
+                    if last_token_time is not None:
+                        itl = (t - last_token_time) * 1000.0
+                        metrics.itl_list.append(itl)
+
+                out_text_parts.append(tok)
+                # Approximate token count using whitespace tokenization
+                try:
+                    metrics.output_tokens = safe_len_tokens("".join(out_text_parts))
+                except Exception:
+                    metrics.output_tokens = len(out_text_parts)
+
+                metrics.token_times.append(t)
+                last_token_time = t
+
+                if metrics.output_tokens > 1 and metrics.first_token_time is not None:
+                    time_since_first = (t - metrics.first_token_time) * 1000.0
+                    metrics.tpot_ms = time_since_first / (metrics.output_tokens - 1)
+                else:
+                    metrics.tpot_ms = 0.0
+
+                total_time = t - metrics.start_time
+                metrics.tps = (metrics.output_tokens / total_time) if total_time > 0 else 0
+
+                await enqueue("token", tag, req_id, {
+                    "provider": provider_label,
+                    "token": tok,
+                    "metrics": {
+                        "ttft_ms": metrics.ttft_ms,
+                        "tpot_ms": metrics.tpot_ms,
+                        "tps": metrics.tps,
+                        "tokens": metrics.output_tokens,
+                    }
+                })
+
+        except Exception as e:
+            await enqueue("error", tag, req_id, {"provider": provider_label, "error": str(e)})
+            if metrics.first_token_time is None:
+                metrics.first_token_time = now()
+                metrics.ttft_ms = (metrics.first_token_time - metrics.start_time) * 1000.0
+
+        metrics.end_time = now()
+        metrics.e2e_ms = (metrics.end_time - metrics.start_time) * 1000.0
+        if metrics.output_tokens > 1 and metrics.ttft_ms > 0:
+            latency_minus_ttft_ms = metrics.e2e_ms - metrics.ttft_ms
+            metrics.tpot_ms = latency_minus_ttft_ms / (metrics.output_tokens - 1)
+        else:
+            metrics.tpot_ms = 0.0
+
+        if usage_seen and metrics.output_tokens != max_tokens:
+            # Strict mode: if provider reported usage and it doesn't match, raise
+            # but don't abort the whole run; report as error and continue
+            await enqueue("error", tag, req_id, {"provider": provider_label, "error": f"Output tokens {metrics.output_tokens} != expected {max_tokens}"})
+
+        await enqueue("end_provider", tag, req_id, {"provider": provider_label, "metrics": metrics})
+        return metrics
+
+    max_conc = max(1, int(concurrency or 1))
+    sem = asyncio.Semaphore(max_conc)
+
+    # Determine how many requests to run
+    num_requests = min(total_reqs, len(dataset_entries))
+
+    tasks: list[asyncio.Task] = []
+    completed_pairs = 0
+    completed_lock = asyncio.Lock()
+
+    async def task_fn(i: int):
+        async with sem:
+            entry_idx = min(i - 1, len(dataset_entries) - 1)
+            entry = dataset_entries[entry_idx]
+            if ds_config is not None:
+                prompt, expected, in_tok, _ = _extract_prompt_and_response(entry, ds_config)
+            else:
+                prompt = str(entry.get("prompt", ""))
+                expected = str(entry.get("response", ""))
+                in_tok = int(entry.get("prompt_tokens", safe_len_tokens(prompt)))
+
+            # Create the A/B request card once
+            await enqueue("create_box_ab", tag, i, {
+                "prompt": prompt,
+                "in_tokens": in_tok,
+            })
+
+            # Run A and B concurrently for the same prompt
+            a_task = asyncio.create_task(run_one_request_ab("A", cfg_a, prompt, expected, in_tok, out_tokens, tag, i))
+            b_task = asyncio.create_task(run_one_request_ab("B", cfg_b, prompt, expected, in_tok, out_tokens, tag, i))
+            a_m, b_m = await asyncio.gather(a_task, b_task)
+
+            async with metrics_lock:
+                all_metrics_a.append(a_m)
+                all_metrics_b.append(b_m)
+
+            async with completed_lock:
+                nonlocal completed_pairs
+                completed_pairs += 1
+                await enqueue("end", tag, i, None)
+
+    for i in range(1, num_requests + 1):
+        tasks.append(asyncio.create_task(task_fn(i)))
+
+    # HTML generator for A/B layout
+    async def gen_html(kind: str, tag: str, req_id: int, payload: Any) -> str:
+        if kind == "create_box_ab":
+            prm = str(payload.get("prompt", ""))[:500]
+            in_tok = int(payload.get("in_tokens", 0))
+            # Two-column response areas for A and B
+            box = Div(
+                Div(
+                    Div(f"Request #{req_id}", cls="request-number"),
+                    cls="request-header"
+                ),
+                Div(
+                    Div(
+                        Div(
+                            Span("PROMPT", cls="section-label"),
+                            Span(f" - Input: {in_tok} tokens", cls="token-info", style="margin-left: 8px; font-size:0.8rem; color: var(--text-muted);"),
+                        ),
+                        Div(prm, cls="content-text"),
+                        cls="prompt-section prompt-small"
+                    ),
+                    Div(
+                        Div(
+                            Span("RESPONSE A", cls="section-label"),
+                            Div(
+                                Div(Span("TTFT: ", cls="metric-label"), Span("--", id=f"ttft-{tag}-A-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("TPOT: ", cls="metric-label"), Span("--", id=f"tpot-{tag}-A-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("TPS: ", cls="metric-label"), Span("--", id=f"tps-{tag}-A-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("Tokens: ", cls="metric-label"), Span("0", id=f"tokens-{tag}-A-{req_id}", cls="metric-value"), cls="metric"),
+                                cls="inline-metrics"
+                            ),
+                            style="display:flex; align-items:center; justify-content: space-between; gap:8px;"
+                        ),
+                        Div(id=f"out-{tag}-A-{req_id}", cls="content-text"),
+                        cls="response-section"
+                    ),
+                    Div(
+                        Div(
+                            Span("RESPONSE B", cls="section-label"),
+                            Div(
+                                Div(Span("TTFT: ", cls="metric-label"), Span("--", id=f"ttft-{tag}-B-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("TPOT: ", cls="metric-label"), Span("--", id=f"tpot-{tag}-B-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("TPS: ", cls="metric-label"), Span("--", id=f"tps-{tag}-B-{req_id}", cls="metric-value"), cls="metric"),
+                                Div(Span("Tokens: ", cls="metric-label"), Span("0", id=f"tokens-{tag}-B-{req_id}", cls="metric-value"), cls="metric"),
+                                cls="inline-metrics"
+                            ),
+                            style="display:flex; align-items:center; justify-content: space-between; gap:8px;"
+                        ),
+                        Div(id=f"out-{tag}-B-{req_id}", cls="content-text"),
+                        cls="response-section"
+                    ),
+                    cls="request-content ab-layout"
+                ),
+                id=f"req-{tag}-{req_id}",
+                cls="request-card",
+                hx_swap_oob=f"beforeend:#reqs-{tag}",
+            )
+            return to_xml(box)
+
+        if kind == "token":
+            data = payload or {}
+            provider = data.get("provider", "")
+            token = data.get("token", "")
+            metrics = data.get("metrics", {})
+            import html as html_lib
+            html_parts = []
+            if token:
+                escaped = html_lib.escape(token)
+                html_parts.append(f'<span id="out-{tag}-{provider}-{req_id}" hx-swap-oob="beforeend">{escaped}</span>')
+            html_parts.append(f'<span id="ttft-{tag}-{provider}-{req_id}" hx-swap-oob="true">{metrics.get("ttft_ms", 0):.0f}ms</span>')
+            html_parts.append(f'<span id="tpot-{tag}-{provider}-{req_id}" hx-swap-oob="true">{metrics.get("tpot_ms", 0):.1f}ms</span>')
+            html_parts.append(f'<span id="tps-{tag}-{provider}-{req_id}" hx-swap-oob="true">{metrics.get("tps", 0):.1f}</span>')
+            html_parts.append(f'<span id="tokens-{tag}-{provider}-{req_id}" hx-swap-oob="true">{metrics.get("tokens", 0)}</span>')
+            return "".join(html_parts)
+
+        if kind == "end":
+            # Pair completed; could update status here if needed
+            return ""
+
+        if kind == "error":
+            data = payload or {}
+            provider = data.get("provider", "")
+            err = data.get("error", "")
+            return f'<div id="out-{tag}-{provider}-{req_id}" class="content-text" hx-swap-oob="beforeend" style="color:var(--danger-color);">Error: {err}</div>'
+
+        return ""
+
+    # Consumer/producer mechanics similar to run_batch
+    producer_done = False
+
+    async def sse_yield(html: str):
+        yield sse_message(NotStr(html))
+
+    async def finalize_when_done():
+        nonlocal producer_done
+        if tasks:
+            await asyncio.gather(*tasks)
+        # We keep it simple: no heavy summary block in A/B mode for now
+        producer_done = True
+
+    asyncio.create_task(finalize_when_done())
+
+    while not (producer_done and queue.empty()):
+        try:
+            kind, tag_, req_id, payload = await asyncio.wait_for(queue.get(), timeout=0.1)
+            html = await gen_html(kind, tag_, req_id, payload)
+            if html:
+                async for msg in sse_yield(html):
+                    yield msg
+        except asyncio.TimeoutError:
+            continue
+
 # ---------- Routes ----------
 
 RUNS: dict[str, Any] = {}
 
 @rt
 def index(req):
-    dsets = _datasets_list()
-    ds_opts = [Option(d.name, value=d.name, selected=True if i == 0 else False)
-               for i, d in enumerate(dsets)] or [Option("none", value="", selected=True)]
+    # Single-prompt A/B UI (no dataset selection)
 
     main = Div(
         # Comparison Banner
@@ -2203,8 +2522,8 @@ def index(req):
             Div(
                 Div(
                     Div(
-                        Span("Model:"),
-                        Code("openai/gpt-oss-120b"),
+                        Span("Models:"),
+                        Code(f"A: {PROV_A.model} | B: {PROV_B.model}"),
                         cls="model-info"
                     ),
                     cls="header-left"
@@ -2214,9 +2533,8 @@ def index(req):
                     cls="btn btn-success",
                     hx_post="/start_run",
                     hx_target="#results",
-                    hx_swap="innerHTML",  # Replace old results instead of appending
-                    # Include both controls and prompts so we get loaded_entries
-                    **{"hx-include": "#controls, #prompts-container"},
+                    hx_swap="innerHTML",
+                    **{"hx-include": "#controls"},
                     style="height: fit-content;"
                 ),
                 cls="header-content"
@@ -2224,37 +2542,38 @@ def index(req):
             cls="header"
         ),
 
-        # Control Panel
+        # Control Panel (Prompt + fixed mode)
         Div(
             Form(id="controls")(
                 Div(
-                    # Left column - Dataset and settings
                     Div(
                         Div(
-                            Label("Dataset"),
-                            Select(*ds_opts, name="dataset", id="dataset-select",
-                                   hx_post="/load_prompts",
-                                   hx_target="#prompts-container",
-                                   hx_trigger="change",
-                                   hx_include="#controls",
-                                   **{"hx-on::after-request": "htmx.trigger(htmx.find('#run-mode-options'), 'reload-modes')"}),
+                            Label("Prompt"),
+                            Textarea(
+                                "Explain transformers in simple terms.",
+                                name="prompt",
+                                id="prompt-input",
+                                cls="prompt-textarea",
+                            ),
                             cls="form-group"
                         ),
                         # Hidden input for out_tokens with default value
                         Input(type="hidden", name="out_tokens", value=500),
+                        # Fixed mode value for server to parse
+                        Input(type="hidden", name="mode", value="ab25"),
                         cls="control-section"
                     ),
-
-                    # Right column - Run mode (will be dynamically loaded)
                     Div(
                         Div(
                             Label("Run Mode"),
                             Div(
-                                id="run-mode-options",
+                                Label(
+                                    Input(type="radio", name="mode_display", value="ab25", checked=True, disabled=True),
+                                    "A/B Side-by-Side (25 concurrent)",
+                                    cls="radio-label"
+                                ),
                                 cls="radio-group",
-                                hx_post="/load_run_modes",
-                                hx_trigger="load, reload-modes",
-                                hx_include="#dataset-select"
+                                id="run-mode-options"
                             ),
                             cls="form-group"
                         ),
@@ -2299,285 +2618,68 @@ def index(req):
 
 @rt
 def load_prompts(dataset: str = None, mode: str = None):
-    """Load prompts and create dynamic UI based on mode selection."""
-    # Default values if not provided
-    if not dataset:
-        dataset = "sharegpt_min1k_50"  # Default dataset
-    if not mode:
-        mode = "single"  # Default mode
+    """Render only the performance summary placeholder on initial load."""
+    # Performance summary placeholder (show hardware; others blank)
+    collapsed_stats_default = Div(
+        Div(
+            Div("Hardware", cls="stat-label"),
+            Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"),
+            cls="stat-item"
+        ),
+        Div(Div("Successful Requests", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Concurrency", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Output Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Tok/s per GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Engine Gen Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Engine Gen Tok/s/GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Total Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Total Input Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Total Generated Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Duration", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        Div(Div("Req Throughput", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
+        cls="stats-grid"
+    )
 
-    ds = _dataset_by_name(dataset)
-    if not ds:
-        return Div(f"Dataset not found: {dataset}", style="color: var(--danger-color);")
-
-    # Parse mode to get number of requests and concurrency
-    total, conc = _parse_mode(mode)
-
-    try:
-        # For the new dataset with 203 entries, always load all of them
-        # This ensures all prompts are available regardless of the selected mode
-        if dataset == "sharegpt_1k_to_1025_all":
-            max_load = 203  # Always load all 203 entries for this dataset
-        else:
-            max_load = max(total, 50)
-        entries = _load_dataset_entries(ds, max_load)
-        if not entries:
-            return Div("No entries found in dataset", style="color: var(--danger-color);")
-
-        # Create prompt boxes
-        prompt_boxes = []
-        # For the sharegpt_1k_to_1025_all dataset, never show individual request/response boxes
-        if dataset == "sharegpt_1k_to_1025_all":
-            display_count = 0
-            # Add a notice instead
-            if total == 1421:
-                message = f"⚡ {total} requests mode - Running 203 dataset entries × 7 iterations"
-            else:
-                message = f"⚡ {total} requests mode - Running all 203 dataset entries"
-
-            prompt_boxes.append(
-                Div(
-                    message,
-                    Div(
-                        f"Concurrency: {conc if conc else 'N/A'}",
-                        style="margin-top: 10px; font-weight: bold;"
-                    ),
-                    cls="info-message",
-                    style="padding: 20px; background: var(--info-bg, #e8f4f8); color: var(--info-color, #0066cc); border-radius: 8px; margin: 20px 0;"
-                )
-            )
-        else:
-            # For other datasets, show prompt boxes as usual
-            display_count = total
-
-        for i, entry in enumerate(entries[:display_count]):
-            prompt, response, p_tokens, r_tokens = _extract_prompt_and_response(entry, ds)
-
-            box = Div(
-                Div(
-                    Div(f"Request #{i+1}", cls="prompt-number"),
-                    cls="prompt-header"
-                ),
-                Div(
-                    Div(
-                        Div(
-                            Span("PROMPT", cls="section-title"),
-                            Span(f" - Input: {p_tokens} tokens", id=f"in-tokens-{i}", cls="token-info", style="margin-left: 10px;"),
-                            style="display: flex; align-items: center;"
-                        ),
-                        Textarea(
-                            prompt,
-                            cls="prompt-textarea",
-                            readonly=True,
-                            id=f"prompt-{i}",
-                            name=f"prompt-{i}"
-                        ),
-                        cls="prompt-input-section"
-                    ),
-                    Div(
-                        Div(
-                            Span("RESPONSE", cls="section-title"),
-                            Div(id=f"metrics-{i}", cls="inline-metrics"),
-                            style="display:flex; align-items:center; justify-content: space-between; gap:8px;"
-                        ),
-                        Div(
-                            id=f"output-{i}",
-                            cls="output-area"
-                        ),
-                        cls="prompt-output-section"
-                    ),
-                    cls="prompt-content"
-                ),
-                cls="prompt-box"
-            )
-            prompt_boxes.append(box)
-
-        # Performance summary placeholder (show hardware; others blank)
-        collapsed_stats_default = Div(
-            Div(
-                Div("Hardware", cls="stat-label"),
-                Div(f"{HW.get('gpu_model','GPU')} × {GPU_COUNT}", cls="stat-value"),
-                cls="stat-item"
+    perf_summary = Div(
+        Div(
+            Div("Performance Summary", cls="perf-title"),
+            Button(
+                "Expand All",
+                cls="expand-btn",
+                onclick="togglePerfMetrics(this)",
+                id="expand-toggle",
+                type="button",
             ),
-            Div(Div("Successful Requests", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Concurrency", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Output Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Tok/s per GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Engine Gen Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Engine Gen Tok/s/GPU", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Total Tok/s", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Total Input Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Total Generated Tokens", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Duration", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            Div(Div("Req Throughput", cls="stat-label"), Div("—", cls="stat-value"), cls="stat-item"),
-            cls="stats-grid"
-        )
+            cls="perf-header",
+        ),
+        Div(
+            Div(collapsed_stats_default, cls="metric-section full-span"),
+            id="perf-metrics-content",
+            cls="perf-metrics perf-metrics-collapsed",
+        ),
+        cls="perf-summary",
+        id="perf-summary",
+        **{"data-expanded": "0"},
+    )
 
-        perf_summary = Div(
-            Div(
-                Div("Performance Summary", cls="perf-title"),
-                Button(
-                    "Expand All",
-                    cls="expand-btn",
-                    onclick="togglePerfMetrics(this)",
-                    id="expand-toggle",
-                    type="button",
-                ),
-                cls="perf-header",
-            ),
-            Div(
-                Div(collapsed_stats_default, cls="metric-section full-span"),
-                id="perf-metrics-content",
-                cls="perf-metrics perf-metrics-collapsed",
-            ),
-            cls="perf-summary",
-            id="perf-summary",
-            **{"data-expanded": "0"},
-        )
-
-        return Div(
-            perf_summary,
-            H3("ShareGPT Dataset", style="color: #1e293b; margin-bottom: 10px; margin-top: 14px;"),
-            Div(*prompt_boxes, cls="prompt-boxes-grid"),
-            # Store metadata for the run
-            Input(type="hidden", name="loaded_entries", value=json.dumps([
-                {
-                    "prompt": e.get("prompt", ""),
-                    "response": e.get("response", ""),
-                    "prompt_tokens": e.get("prompt_tokens", 0),
-                    "response_tokens": e.get("response_tokens", 0)
-                } for e in entries[:total]
-            ]))
-        )
-
-    except Exception as e:
-        return Div(f"Error loading dataset: {str(e)}", style="color: var(--danger-color);")
+    return Div(perf_summary)
 
 
 @rt
 def load_run_modes(dataset: str = None):
-    """Load run mode options based on the selected dataset."""
-    if not dataset:
-        dataset = "sharegpt_min1k_50"  # Default dataset
-
-    # Special handling for the new dataset
-    if dataset == "sharegpt_1k_to_1025_all":
-        return Div(
-            Label(
-                Input(type="radio", name="mode", value="1421x40", checked=True,
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (40 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x80",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (80 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x120",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (120 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x140",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (140 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x160",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (160 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x180",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (180 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x200",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (200 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x220",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (220 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="1421x240",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "1421 Requests - 203×7 (240 Concurrent)",
-                cls="radio-label"
-            ),
-            cls="radio-group"
-        )
-    else:
-        # Default options for other datasets
-        return Div(
-            Label(
-                Input(type="radio", name="mode", value="single", checked=True,
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "Single Request",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="10x1",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "10 Requests (2 Concurrent)",
-                cls="radio-label"
-            ),
-            Label(
-                Input(type="radio", name="mode", value="50x10",
-                      hx_post="/load_prompts",
-                      hx_target="#prompts-container",
-                      hx_trigger="change",
-                      hx_include="#controls"),
-                "50 Requests (10 Concurrent)",
-                cls="radio-label"
-            ),
-            cls="radio-group"
-        )
+    """Single A/B mode only, fixed to 25 concurrent requests."""
+    return Div(
+        Label(
+            Input(type="radio", name="mode", value="ab25", checked=True,
+                  hx_post="/load_prompts",
+                  hx_target="#prompts-container",
+                  hx_trigger="change",
+                  hx_include="#controls"),
+            "A/B Side-by-Side (25 concurrent)",
+            cls="radio-label"
+        ),
+        cls="radio-group"
+    )
 
 @rt
 def sample(dataset: str):
@@ -2612,105 +2714,54 @@ def sample(dataset: str):
 
 
 def _parse_mode(mode: str) -> tuple[int, int]:
-    m = (mode or "single").lower()
-    if m == "single":
-        return 1, 1
-    if m == "10x1":
-        # Run 10 requests at concurrency 2 as requested
-        return 10, 2
-    if m == "50x10":
-        return 50, 10
-    # 1421 requests (203 * 7) modes with various concurrency levels
-    if m == "1421x40":
-        return 1421, 40
-    if m == "1421x80":
-        return 1421, 80
-    if m == "1421x120":
-        return 1421, 120
-    if m == "1421x140":
-        return 1421, 140
-    if m == "1421x160":
-        return 1421, 160
-    if m == "1421x180":
-        return 1421, 180
-    if m == "1421x200":
-        return 1421, 200
-    if m == "1421x220":
-        return 1421, 220
-    if m == "1421x240":
-        return 1421, 240
-    return 1, 1
+    m = (mode or "ab25").lower()
+    if m == "ab25":
+        # 25 total requests, 25 concurrent (each request fans out to A and B)
+        return 25, 25
+    # Fallback
+    return 25, 25
 
 
 @rt("/start_run")
-async def post(dataset: str, out_tokens: int, mode: str, loaded_entries: str = None):
-    print(f"start_run called with dataset={dataset}, out_tokens={out_tokens}, mode={mode}")
+async def post(prompt: str = None, dataset: str = None, out_tokens: int = 0, mode: str = "ab25", loaded_entries: str = None):
+    print(f"start_run called with prompt_len={len(prompt or '')}, dataset={dataset}, out_tokens={out_tokens}, mode={mode}")
     rid = uuid.uuid4().hex[:8]
     ttag = f"RUN-{rid}"
     total, conc = _parse_mode(mode)
     print(f"Parsed mode '{mode}' to total={total}, conc={conc}")
 
-    # Load dataset
-    if not dataset:
-        return Div(
-            "Please select a dataset first",
-            style="padding: 20px; color: var(--danger-color); background: white; border-radius: 8px; margin: 10px 0;"
-        )
-
-    ds = _dataset_by_name(dataset)
-    if not ds:
-        return Div(
-            "Dataset not found",
-            style="padding: 20px; color: var(--danger-color); background: white; border-radius: 8px; margin: 10px 0;"
-        )
-
-    # Prefer the prompts that were already loaded into the page if provided
-    try:
-        entries: list[dict]
-        if loaded_entries:
-            try:
-                parsed = json.loads(loaded_entries)
-                if isinstance(parsed, list) and parsed:
-                    # For sharegpt_1k_to_1025_all, use all loaded entries
-                    if dataset == "sharegpt_1k_to_1025_all":
-                        entries = parsed  # Use all 203 entries
-                    else:
-                        entries = parsed[:total]  # Use requested entries for other datasets
-                else:
-                    # Load all 203 for the special dataset, otherwise load requested amount
-                    max_load = 203 if dataset == "sharegpt_1k_to_1025_all" else total
-                    entries = _load_dataset_entries(ds, max_load)
-            except Exception:
-                # Load all 203 for the special dataset, otherwise load requested amount
-                max_load = 203 if dataset == "sharegpt_1k_to_1025_all" else total
-                entries = _load_dataset_entries(ds, max_load)
+    # Build request entries for A/B mode: repeat the same prompt "total" times
+    entries: list[dict] = []
+    if (mode or "").lower() == "ab25":
+        text = (prompt or "Explain transformers in simple terms.").strip()
+        for _ in range(total):
+            entries.append({"prompt": text, "response": "", "prompt_tokens": safe_len_tokens(text), "response_tokens": 0})
+    else:
+        # Fallback: try dataset if provided; otherwise default to single prompt
+        if dataset:
+            ds = _dataset_by_name(dataset)
+            if not ds:
+                return Div("Dataset not found", style="padding: 20px; color: var(--danger-color); background: white; border-radius: 8px; margin: 10px 0;")
+            entries = _load_dataset_entries(ds, total)
         else:
-            # Load all 203 for the special dataset, otherwise load requested amount
-            max_load = 203 if dataset == "sharegpt_1k_to_1025_all" else total
-            entries = _load_dataset_entries(ds, max_load)
-
-        if not entries:
-            return Div(
-                "No entries found in dataset",
-                style="padding: 20px; color: var(--danger-color); background: white; border-radius: 8px; margin: 10px 0;"
-            )
-    except Exception as e:
-        return Div(
-            f"Error loading dataset: {str(e)}",
-            style="padding: 20px; color: var(--danger-color); background: white; border-radius: 8px; margin: 10px 0;"
-        )
+            text = (prompt or "Explain transformers in simple terms.").strip()
+            entries = [{"prompt": text} for _ in range(total)]
 
     # Clear all previous runs to prevent stale SSE streams
     old_runs = list(RUNS.keys())
     RUNS.clear()
 
+    # A/B mode flag
+    ab_mode = (mode or "").lower() == "ab25"
+
     RUNS[rid] = {
         "dataset_entries": entries,
-        "ds_config": ds,
+        "ds_config": None,
         "out_tokens": int(out_tokens),
         "total": total,
         "conc": conc,
-        "use_loaded": bool(loaded_entries)
+        "use_loaded": False,
+        "ab_mode": ab_mode,
     }
     print(f"Cleared old runs: {old_runs}")
     print(f"Created run {rid} in RUNS. Current runs: {list(RUNS.keys())}")
@@ -2783,17 +2834,30 @@ async def get(run_id: str):
     tag = f"RUN-{run_id}"
 
     async def gen():
-        async for msg in run_batch(
-            PROV,
-            ri["dataset_entries"],
-            ri["ds_config"],
-            ri["out_tokens"],
-            ri["total"],
-            ri["conc"],
-            tag,
-            ri.get("use_loaded", False),
-        ):
-            yield msg
+        if ri.get("ab_mode", False):
+            async for msg in run_ab_batch(
+                PROV_A,
+                PROV_B,
+                ri["dataset_entries"],
+                ri.get("ds_config"),
+                ri["out_tokens"],
+                ri["total"],
+                ri["conc"],
+                tag,
+            ):
+                yield msg
+        else:
+            async for msg in run_batch(
+                PROV,
+                ri["dataset_entries"],
+                ri["ds_config"],
+                ri["out_tokens"],
+                ri["total"],
+                ri["conc"],
+                tag,
+                ri.get("use_loaded", False),
+            ):
+                yield msg
 
         # Update status to complete
         yield sse_message(NotStr(to_xml(
